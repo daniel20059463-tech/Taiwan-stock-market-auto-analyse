@@ -57,20 +57,22 @@ GitHub tag 格式統一為：
 
 Tauri Windows 打包會產出 updater 需要的簽章素材，但不會自動替本機 release 流程組出可直接上傳到 GitHub Releases 的 `latest.json`。這一段由 release 腳本負責。
 
-第一版固定使用 Tauri v2 Windows updater artifact 作為更新包來源。
+第一版固定使用這台機器實際觀察到的 Tauri v2 Windows updater artifact 作為更新包來源。
 
 說明：
 - 一般安裝資產仍會保留並上傳：
   - `src-tauri/target/release/bundle/msi/Taiwan Alpha Radar_<version>_x64_en-US.msi`
   - `src-tauri/target/release/bundle/nsis/Taiwan Alpha Radar_<version>_x64-setup.exe`
-- 但 `latest.json` 所指向的更新資產，不是 `.exe`，而是 updater 專用的 `.nsis.zip`。
-- 目前本機既有打包結果只看到 `.msi` 與 `.exe`，因此真正實作時必須先啟用 `bundle.createUpdaterArtifacts = true`，並以首次實際打包結果核對檔名；若未產出 `.nsis.zip` 與 `.sig`，腳本必須中止。
+- 這個工具鏈在啟用 updater 產物後，實際可用的 updater 資產為：
+  - `src-tauri/target/release/bundle/nsis/Taiwan Alpha Radar_<version>_x64-setup.exe`
+  - `src-tauri/target/release/bundle/nsis/Taiwan Alpha Radar_<version>_x64-setup.exe.sig`
+- 因此 `latest.json` 的 `url` 應指向 `.exe`，`signature` 則來自 `.exe.sig`。
+- 若未產出 `.exe.sig`，腳本必須中止。
 
 腳本需要使用以下產物：
 - `src-tauri/target/release/bundle/nsis/Taiwan Alpha Radar_<version>_x64-setup.exe`
 - `src-tauri/target/release/bundle/msi/Taiwan Alpha Radar_<version>_x64_en-US.msi`
-- `src-tauri/target/release/bundle/nsis/Taiwan Alpha Radar_<version>_x64-setup.nsis.zip`
-- `src-tauri/target/release/bundle/nsis/Taiwan Alpha Radar_<version>_x64-setup.nsis.zip.sig`
+- `src-tauri/target/release/bundle/nsis/Taiwan Alpha Radar_<version>_x64-setup.exe.sig`
 
 腳本需自行產生 `latest.json`，格式明確如下：
 
@@ -82,7 +84,7 @@ Tauri Windows 打包會產出 updater 需要的簽章素材，但不會自動替
   "platforms": {
     "windows-x86_64": {
       "signature": "<.sig file content>",
-      "url": "https://github.com/daniel20059463-tech/Taiwan-stock-market-auto-analyse/releases/download/v0.1.0/Taiwan%20Alpha%20Radar_0.1.0_x64-setup.nsis.zip"
+      "url": "https://github.com/daniel20059463-tech/Taiwan-stock-market-auto-analyse/releases/download/v0.1.0/Taiwan%20Alpha%20Radar_0.1.0_x64-setup.exe"
     }
   }
 }
@@ -109,7 +111,7 @@ Tauri Windows 打包會產出 updater 需要的簽章素材，但不會自動替
 - 生成 tag `vX.Y.Z`
 - 檢查 GitHub 預設分支是否已存在對應遠端來源
 - 執行 `npm run desktop:package`
-- 檢查 `.exe`、`.msi`、`.nsis.zip`、`.sig`
+- 檢查 `.exe`、`.msi`、`.exe.sig`
 - 組裝 `latest.json`
 - 建立 draft GitHub Release
 - 上傳資產
@@ -141,7 +143,7 @@ Tauri Windows 打包會產出 updater 需要的簽章素材，但不會自動替
 2. repo 不可存取
 3. 同版號 tag 已存在
 4. `TAURI_SIGNING_PRIVATE_KEY` 或 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 未設定（打包前）
-5. `.msi`、`.exe`、`.nsis.zip`、`.sig` 缺失
+5. `.msi`、`.exe`、`.exe.sig` 缺失
 6. `latest.json` 組裝失敗
 7. target ref 不存在於 GitHub
 

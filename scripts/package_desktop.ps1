@@ -144,6 +144,18 @@ $tauriSigningPrivateKey = Get-EnvironmentValue -Name "TAURI_SIGNING_PRIVATE_KEY"
 $tauriSigningPrivateKeyPassword = Get-EnvironmentValue -Name "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
 $tauriUpdaterPublicKey = Get-EnvironmentValue -Name "TAURI_UPDATER_PUBLIC_KEY"
 
+if ($tauriSigningPrivateKey) {
+    $env:TAURI_SIGNING_PRIVATE_KEY = $tauriSigningPrivateKey
+}
+
+if ($tauriSigningPrivateKeyPassword) {
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $tauriSigningPrivateKeyPassword
+}
+
+if ($tauriUpdaterPublicKey) {
+    $env:TAURI_UPDATER_PUBLIC_KEY = $tauriUpdaterPublicKey
+}
+
 if (-not $tauriSigningPrivateKey) {
     Write-Warning "TAURI_SIGNING_PRIVATE_KEY not set. Release builds that generate updater artifacts will fail until it is configured."
 }

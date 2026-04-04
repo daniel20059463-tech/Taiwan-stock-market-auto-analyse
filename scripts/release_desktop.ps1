@@ -48,22 +48,58 @@ function Get-EnvironmentValue {
     return $null
 }
 
+function Invoke-GhProcess {
+    param(
+        [string]$GhPath,
+        [string[]]$Arguments
+    )
+
+    $escapedArguments = $Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + ($_ -replace '"', '\"') + '"'
+        } else {
+            $_
+        }
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $GhPath
+    $psi.Arguments = ($escapedArguments -join ' ')
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    [void]$process.Start()
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    return [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        StdOut = $stdout
+        StdErr = $stderr
+    }
+}
+
 function Invoke-GitHubJson {
     param(
         [string]$GhPath,
         [string]$Endpoint
     )
 
-    $output = & $GhPath api $Endpoint
-    if ($LASTEXITCODE -ne 0) {
+    $result = Invoke-GhProcess -GhPath $GhPath -Arguments @("api", $Endpoint)
+    if ($result.ExitCode -ne 0) {
         return $null
     }
 
-    if (-not $output) {
+    if (-not $result.StdOut) {
         return $null
     }
 
-    return $output | ConvertFrom-Json
+    return $result.StdOut | ConvertFrom-Json
 }
 
 function Test-GitHubApiSuccess {
@@ -72,8 +108,8 @@ function Test-GitHubApiSuccess {
         [string]$Endpoint
     )
 
-    & $GhPath api $Endpoint *> $null
-    return $LASTEXITCODE -eq 0
+    $result = Invoke-GhProcess -GhPath $GhPath -Arguments @("api", $Endpoint)
+    return $result.ExitCode -eq 0
 }
 
 function Get-RequiredArtifact {
@@ -118,6 +154,16 @@ function New-LatestJson {
     Set-Content -LiteralPath $OutputPath -Value $json -Encoding utf8
 }
 
+function Write-Utf8NoBomFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $tauriConfigPath = Join-Path $projectRoot "src-tauri\tauri.conf.json"
 $packageScriptPath = Join-Path $projectRoot "scripts\package_desktop.ps1"
@@ -151,6 +197,18 @@ try {
     $tauriSigningPrivateKey = Get-EnvironmentValue -Name "TAURI_SIGNING_PRIVATE_KEY"
     $tauriSigningPrivateKeyPassword = Get-EnvironmentValue -Name "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
     $tauriUpdaterPublicKey = Get-EnvironmentValue -Name "TAURI_UPDATER_PUBLIC_KEY"
+
+    if ($tauriSigningPrivateKey) {
+        $env:TAURI_SIGNING_PRIVATE_KEY = $tauriSigningPrivateKey
+    }
+
+    if ($tauriSigningPrivateKeyPassword) {
+        $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $tauriSigningPrivateKeyPassword
+    }
+
+    if ($tauriUpdaterPublicKey) {
+        $env:TAURI_UPDATER_PUBLIC_KEY = $tauriUpdaterPublicKey
+    }
 
     if (-not $tauriSigningPrivateKey) {
         Fail-Step "TAURI_SIGNING_PRIVATE_KEY is required before packaging updater artifacts."
@@ -208,9 +266,14 @@ try {
     if (-not $tauriConfig.bundle) {
         $tauriConfig | Add-Member -NotePropertyName bundle -NotePropertyValue ([ordered]@{})
     }
-    $tauriConfig.bundle.createUpdaterArtifacts = $true
+    if (-not ($tauriConfig.bundle.PSObject.Properties.Name -contains "createUpdaterArtifacts")) {
+        $tauriConfig.bundle | Add-Member -NotePropertyName createUpdaterArtifacts -NotePropertyValue $true
+    } else {
+        $tauriConfig.bundle.createUpdaterArtifacts = $true
+    }
 
-    $tauriConfig | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $tauriConfigPath -Encoding utf8
+    $updatedConfigJson = $tauriConfig | ConvertTo-Json -Depth 32
+    Write-Utf8NoBomFile -Path $tauriConfigPath -Content $updatedConfigJson
 
     Write-Step "Packaging desktop application"
     Invoke-CheckedCommand -FilePath "powershell.exe" -Arguments @(
@@ -226,8 +289,8 @@ try {
 
     $installerExe = Get-RequiredArtifact -Directory $nsisDir -Filter ("Taiwan Alpha Radar_{0}_x64-setup.exe" -f $version) -Label "NSIS installer"
     $installerMsi = Get-RequiredArtifact -Directory $msiDir -Filter ("Taiwan Alpha Radar_{0}_x64_en-US.msi" -f $version) -Label "MSI installer"
-    $updaterZip = Get-RequiredArtifact -Directory $nsisDir -Filter ("Taiwan Alpha Radar_{0}_x64-setup.nsis.zip" -f $version) -Label "NSIS updater zip"
-    $updaterSig = Get-RequiredArtifact -Directory $nsisDir -Filter ("Taiwan Alpha Radar_{0}_x64-setup.nsis.zip.sig" -f $version) -Label "NSIS updater signature"
+    $updaterArtifact = Get-RequiredArtifact -Directory $nsisDir -Filter ("Taiwan Alpha Radar_{0}_x64-setup.exe" -f $version) -Label "Updater artifact"
+    $updaterSig = Get-RequiredArtifact -Directory $nsisDir -Filter ("Taiwan Alpha Radar_{0}_x64-setup.exe.sig" -f $version) -Label "Updater signature"
 
     $tempDir = Join-Path $projectRoot (".release\tmp-{0}" -f ([guid]::NewGuid().ToString("N")))
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
@@ -235,7 +298,7 @@ try {
     $latestJsonPath = Join-Path $tempDir "latest.json"
     $releaseNotesPath = Join-Path $tempDir "release-notes.md"
 
-    $encodedUpdaterName = [System.Uri]::EscapeDataString($updaterZip.Name)
+    $encodedUpdaterName = [System.Uri]::EscapeDataString($updaterArtifact.Name)
     $releaseAssetUrl = "https://github.com/$Repo/releases/download/$tag/$encodedUpdaterName"
     $signature = (Get-Content -LiteralPath $updaterSig.FullName -Raw).Trim()
 
@@ -253,7 +316,7 @@ try {
 - 主要資產：
   - $($installerExe.Name)
   - $($installerMsi.Name)
-  - $($updaterZip.Name)
+  - $($updaterArtifact.Name)
   - latest.json
 "@
     Set-Content -LiteralPath $releaseNotesPath -Value $releaseNotes -Encoding utf8
@@ -264,7 +327,7 @@ try {
         Write-Host "Release tag: $tag" -ForegroundColor Green
         Write-Host "Installer: $($installerExe.FullName)" -ForegroundColor Green
         Write-Host "MSI: $($installerMsi.FullName)" -ForegroundColor Green
-        Write-Host "Updater zip: $($updaterZip.FullName)" -ForegroundColor Green
+        Write-Host "Updater artifact: $($updaterArtifact.FullName)" -ForegroundColor Green
         Write-Host "Updater sig: $($updaterSig.FullName)" -ForegroundColor Green
         Write-Host "latest.json: $latestJsonPath" -ForegroundColor Green
         return
@@ -286,7 +349,7 @@ try {
         "release", "upload", $tag,
         $installerExe.FullName,
         $installerMsi.FullName,
-        $updaterZip.FullName,
+        $updaterArtifact.FullName,
         $updaterSig.FullName,
         $latestJsonPath,
         "--repo", $Repo
@@ -303,7 +366,7 @@ try {
     $expectedNames = @(
         $installerExe.Name,
         $installerMsi.Name,
-        $updaterZip.Name,
+        $updaterArtifact.Name,
         $updaterSig.Name,
         "latest.json"
     )
@@ -337,7 +400,7 @@ catch {
 }
 finally {
     if ($restoreConfig -ne $null) {
-        Set-Content -LiteralPath $tauriConfigPath -Value $restoreConfig -Encoding utf8
+        Write-Utf8NoBomFile -Path $tauriConfigPath -Content $restoreConfig
     }
 
     if ($tempDir -and (Test-Path $tempDir)) {
