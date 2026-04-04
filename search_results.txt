@@ -1,0 +1,12 @@
+Line 1119:
+1118:       >
+1119:         <Panel title="訊號列表">
+1120:           <div ref={signalScrollRef} style={{ height: "380px", overflow: "auto" }}>
+1121:             <div style={{ height: `${signalVirtualizer.getTotalSize()}px`, position: "relative" }}>
+
+Line 1161:
+1160: 
+1161:         <Panel title={chartMode === "history" ? "歷史摘要" : "盤中摘要"}>
+1162:           <div ref={historyScrollRef} style={{ display: "grid", gap: "14px", minHeight: "380px" }}>
+1163:             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "12px" }}>
+

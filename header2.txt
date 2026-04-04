@@ -1,0 +1,100 @@
+851:                   即時盤面
+852:                 </div>
+853:                 <div style={{ display: "flex", gap: "10px", alignItems: "baseline", marginTop: "6px", flexWrap: "wrap" }}>
+854:                   <strong style={{ fontSize: "30px" }}>
+855:                     {selectedSnapshot ? formatSymbolLabel(selectedSnapshot.symbol, selectedSnapshot.quote.name) : "--"}
+856:                   </strong>
+857:                   <span style={{ color: palette.muted }}>
+858:                     {selectedSnapshot ? formatSectorLabel(resolveSectorKey(selectedSnapshot.symbol, selectedSnapshot.quote.sector)) : ""}
+859:                   </span>
+860:                   <span
+861:                     ref={priceFlashRef}
+862:                     style={{ ...marketNumbers, color: palette.muted }}
+863:                     suppressHydrationWarning
+864:                   >
+865:                     {selectedSnapshot ? fmtPrice(selectedSnapshot.quote.last) : "--"}
+866:                   </span>
+867:                   <span style={{ ...marketNumbers, color: priceTone(selectedSnapshot?.quote.changePct ?? 0) }}>
+868:                     {selectedSnapshot ? fmtPct(selectedSnapshot.quote.changePct) : "--"}
+869:                   </span>
+870:                   <span
+871:                     style={{
+872:                       padding: "4px 10px",
+873:                       borderRadius: "0px",
+874:                       border: `1px solid ${palette.border}`,
+875:                       background: palette.panel,
+876:                       color: palette.muted,
+877:                       fontSize: "15px",
+878:                       letterSpacing: "0.08em",
+879:                       textTransform: "uppercase",
+880:                     }}
+881:                   >
+882:                     {chartMode === "history" ? "歷史日 K" : "今日盤中 1 分 K"}
+883:                   </span>
+884:                   {chartMode === "history" ? (
+885:                     <span style={{ color: palette.muted, fontSize: "15px" }}>
+886:                       {historyLoadingSymbol === selectedSymbol
+887:                         ? "歷史資料載入中"
+888:                         : selectedHistory?.source === "sinopac"
+889:                           ? "資料來源：永豐歷史日K"
+890:                           : selectedHistory?.error
+891:                             ? "歷史資料暫時失敗，已回退到即時快照"
+892:                             : "資料來源：即時快照回退"}
+893:                     </span>
+894:                   ) : (
+895:                     <span style={{ color: palette.muted, fontSize: "15px" }}>
+896:                       {sessionLoadingSymbol === selectedSymbol
+897:                         ? "今日盤中資料載入中"
+898:                         : selectedSession?.source === "sinopac"
+899:                           ? "資料來源：永豐盤中 1 分K"
+900:                           : selectedSession?.error
+901:                             ? "盤中資料暫時失敗，已回退到即時快照"
+902:                             : "資料來源：即時快照"}
+903:                     </span>
+904:                   )}
+905:                 </div>
+906:               </div>
+907:               <div style={{ display: "grid", gridTemplateColumns: "minmax(220px, 1fr) 180px 300px auto", gap: "10px", width: "100%", maxWidth: "920px" }}>
+908:                 <input
+909:                   value={searchTerm}
+910:                   onChange={(event) => setSearchTerm(event.target.value)}
+911:                   placeholder="搜尋代碼、名稱或類股"
+912:                   style={{
+913:                     padding: "10px 12px",
+914:                     borderRadius: "0px",
+915:                     border: `1px solid ${palette.border}`,
+916:                     background: palette.panel,
+917:                     color: palette.text,
+918:                   }}
+919:                 />
+920:                 <select
+921:                   value={sectorFilter}
+922:                   onChange={(event) => setSectorFilter(event.target.value)}
+923:                   style={{
+924:                     padding: "10px 12px",
+925:                     borderRadius: "0px",
+926:                     border: `1px solid ${palette.border}`,
+927:                     background: palette.panel,
+928:                     color: palette.text,
+929:                   }}
+930:                 >
+931:                   {sectorOptions.map((sector) => (
+932:                     <option key={sector} value={sector}>
+933:                       {formatSectorLabel(sector)}
+934:                     </option>
+935:                   ))}
+936:                 </select>
+937:                 <select
+938:                   value={selectedSymbol}
+939:                   onChange={(event) => setSelectedSymbol(event.target.value)}
+940:                   style={{
+941:                     padding: "10px 12px",
+942:                     borderRadius: "0px",
+943:                     border: `1px solid ${palette.border}`,
+944:                     background: palette.panel,
+945:                     color: palette.text,
+946:                     ...marketNumbers,
+947:                   }}
+948:                 >
+949:                   {filteredRows.map((row) => (
+950:                     <option key={row.symbol} value={row.symbol}>

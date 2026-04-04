@@ -1,0 +1,3 @@
+Line 1172:                 <div style={{ color: palette.muted, fontSize: "15px", letterSpacing: "0.08em", textTransform: "uppercase" }}>價格結構</div>
+Line 1186:                 <div style={{ color: palette.muted, fontSize: "15px", letterSpacing: "0.08em", textTransform: "uppercase" }}>技術位階</div>
+Line 1198:                 <div style={{ color: palette.muted, fontSize: "15px", letterSpacing: "0.08em", textTransform: "uppercase" }}>量能輪廓</div>

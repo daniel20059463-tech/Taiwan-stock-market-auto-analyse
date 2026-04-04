@@ -1,0 +1,28 @@
+🇹🇼 台股模擬交易系統 - AI 開發架構與安全規範 (AGENT.md)
+1. 系統核心與架構解耦 (Architecture Decoupling)
+本系統嚴禁採用「單一腳本包山包海」的寫法。為避免 CPU 密集運算阻塞 I/O，系統必須拆分為以下獨立模組，並透過 Message Queue（如 Redis/Celery）進行溝通：
+Collector (I/O 層)：專責非同步抓取行情與新聞。
+Analyzer Worker (CPU 層)：專責 NLP 輿情分析與模型推論，獨立於主執行緒之外。
+Signal Engine (決策層)：接收乾淨數據產生訊號，不直接碰觸外部 API。
+Notifier (通知層)：專責發送結果至 Telegram。
+2. 效能與併發防護邊界 (Performance Guardrails)
+嚴格的非同步原則：所有網路請求與 Telegram 廣播，必須全面使用 asyncio、aiohttp 或 websockets。
+禁止阻塞事件迴圈：絕對不可在 asyncio 迴圈內直接執行 Pandas、NLP 分析等 CPU-bound 工作，必須交由 ProcessPoolExecutor 或獨立的 Worker 處理，否則將導致假即時與延遲。
+快取與速率限制 (Rate Limit)：外部資料源與 Telegram API 皆須實作本地快取與 Token Bucket 限流機制，同一訊號區間內去重後才發送，避免觸發 API 封鎖。
+3. 交易安全與資料庫鎖定 (Transaction Security)
+防範競態條件 (Race Condition)：禁止使用 SQLite 或單純的 Python dict 記錄帳戶狀態。必須採用 PostgreSQL，且在處理任何餘額扣款或部位變更時，強制使用悲觀鎖 (Row-level Lock，如 SELECT ... FOR UPDATE)。
+指令冪等性 (Idempotency)：每一筆交易與訊號必須帶有唯一 UUID 與時間戳記，防止網路重試造成重複下單。
+4. 資安邊界與 Telegram 降級原則 (Security & Permissions)
+Telegram 降級為「申請入口」：Telegram 僅作為通知顯示器，絕非系統控制台。Bot 不得直接執行敏感的交易或系統操作，高風險指令（如清除快取、切換資料源）必須有白名單與雙重驗證 (Challenge Token)。
+機密集中管理 (Secrets Management)：所有 API Key、Bot Token 與資料庫帳密，絕對不可明碼寫入程式碼或 Log 中。必須透過集中式的環境變數 (如 .env) 或 Secret Manager 存取。
+Webhook 驗證：若使用 Telegram Webhook，必須在 API Gateway 或 Nginx 層強制檢驗 X-Telegram-Bot-Api-Secret-Token。
+5. AI Agent 工作與自我修正迴圈 (Feedback Loop)
+身為協助開發的 AI Agent，你必須在一個可持續自我驗證的迴圈內工作
+：
+產出程式碼後，必須自行撰寫並執行測試 (Test)
+。
+若遇到錯誤或 Linter 警告（包含安全規則違反），請自行讀取 Error Log (Read Logs)
+。
+重現問題並自我修正 (Reproduce & Fix)
+。
+若重複失敗達 3 次，或涉及架構邊界變更，請暫停並向人類開發者回報。

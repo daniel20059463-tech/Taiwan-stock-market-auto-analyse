@@ -1,0 +1,100 @@
+751: 
+752:   const topTapeRows = [...filteredRows]
+753:     .filter((row) => row.quote.volume > 0 || row.quote.changePct !== 0)
+754:     .sort((left, right) => Math.abs(right.quote.changePct) - Math.abs(left.quote.changePct))
+755:     .slice(0, 8);
+756: 
+757:   const normalizedCandles = processCandles(displayCandles);
+758:   const periodHigh = normalizedCandles.reduce((max, candle) => Math.max(max, candle.high), Number.NEGATIVE_INFINITY);
+759:   const periodLow = normalizedCandles.reduce((min, candle) => Math.min(min, candle.low), Number.POSITIVE_INFINITY);
+760:   const lastCandle = normalizedCandles.at(-1) ?? null;
+761:   const previousCandle = normalizedCandles.at(-2) ?? null;
+762:   const openReference = chartMode === "history" ? normalizedCandles.at(0)?.open ?? selectedSnapshot?.quote.open ?? 0 : selectedSnapshot?.quote.open ?? 0;
+763:   const lastPrice = selectedSnapshot?.quote.last ?? lastCandle?.close ?? 0;
+764:   const dayRange = Number.isFinite(periodHigh) && Number.isFinite(periodLow) ? periodHigh - periodLow : 0;
+765:   const rangePct = periodLow > 0 ? (dayRange / periodLow) * 100 : 0;
+766:   const distanceFromHigh = Number.isFinite(periodHigh) ? periodHigh - lastPrice : 0;
+767:   const distanceFromLow = Number.isFinite(periodLow) ? lastPrice - periodLow : 0;
+768:   const ma5Value = getSmaValue(displayCandles, 5);
+769:   const ma20Value = getSmaValue(displayCandles, 20);
+770:   const ma60Value = getSmaValue(displayCandles, 60);
+771:   const avgCandleVolume =
+772:     normalizedCandles.length > 0
+773:       ? normalizedCandles.reduce((sum, candle) => sum + candle.volume, 0) / normalizedCandles.length
+774:       : 0;
+775:   const latestVolumeRatio = avgCandleVolume > 0 && lastCandle ? lastCandle.volume / avgCandleVolume : 0;
+776:   const sourceLabel =
+777:     chartMode === "history"
+778:       ? selectedHistory?.source === "sinopac"
+779:         ? "永豐歷史日K"
+780:         : "即時快照回退"
+781:       : selectedSession?.source === "sinopac"
+782:         ? "永豐盤中"
+783:         : "即時快照";
+784:   const dataFreshnessLabel = selectedSnapshot?.quote.ts ? fmtAge(selectedSnapshot.quote.ts) : "--";
+785:   const dataFreshnessTone =
+786:     !selectedSnapshot?.quote.ts ? palette.muted : Date.now() - selectedSnapshot.quote.ts <= 15_000 ? palette.accent : palette.warning;
+787:   const signalVirtualizer = useVirtualizer({
+788:     count: signalRows.length,
+789:     getScrollElement: () => signalScrollRef.current,
+790:     estimateSize: () => 42,
+791:     overscan: 10,
+792:   });
+793: 
+794:   return (
+795:     <div style={shellStyle}>
+796:       <div
+797:         style={{
+798:           display: "flex",
+799:           alignItems: "center",
+800:           justifyContent: "space-between",
+801:           gap: "16px",
+802:           marginBottom: "18px",
+803:           padding: "18px 20px",
+804:           border: `1px solid ${palette.border}`,
+805:           borderRadius: "0px",
+806:           background: palette.panel,
+807:         }}
+808:       >
+809:         <div>
+810:           <div style={{ color: palette.muted, fontSize: "15px", letterSpacing: "0.14em", textTransform: "uppercase" }}>
+811:             執行主控台
+812:           </div>
+813:           <h1 style={{ margin: "6px 0 0", fontSize: "35px", lineHeight: 1.1 }}>{title}</h1>
+814:         </div>
+815:         <div
+816:           style={{
+817:             display: "grid",
+818:             gridTemplateColumns: "repeat(7, minmax(110px, 1fr))",
+819:             gap: "12px",
+820:             minWidth: "930px",
+821:           }}
+822:         >
+823:           <MetricCard label="連線狀態" value={{ idle: "閒置", connecting: "連線中", open: "已連線", reconnecting: "重新連線中", closed: "已關閉", error: "異常" }[connectionState] ?? connectionState.toUpperCase()} tone={connectionState === "open" ? palette.accent : connectionState === "closed" || connectionState === "error" ? palette.danger : palette.warning} />
+824:           <MetricCard label="追蹤總數" value={String(symbolRows.length)} tone={palette.text} />
+825:           <MetricCard label="篩選結果" value={String(filteredRows.length)} tone={palette.muted} />
+826:           <MetricCard label="丟棄策略" value={deferredSnapshot?.dropMode ? "僅保留最新" : "正常"} tone={deferredSnapshot?.dropMode ? palette.warning : palette.muted} />
+827:           <MetricCard label="資料來源" value={sourceLabel} tone={chartMode === "history" ? palette.warning : palette.muted} />
+828:           <MetricCard label="最後更新" value={dataFreshnessLabel} tone={dataFreshnessTone} />
+829:           <MetricCard
+830:             label="大盤漲跌"
+831:             value={portfolio != null ? fmtPct(portfolio.marketChangePct ?? 0) : "--"}
+832:             tone={portfolio != null ? priceTone(portfolio.marketChangePct ?? 0) : palette.muted}
+833:           />
+834:         </div>
+835:       </div>
+836: 
+837:       <div style={gridStyle}>
+838:         <ErrorBoundary label="K線圖表區">
+839:         <section
+840:           style={{
+841:             border: `1px solid ${palette.border}`,
+842:             borderRadius: "0px",
+843:             background: palette.panel,
+844:             padding: "18px",
+845:           }}
+846:         >
+847:           <div style={{ display: "grid", gap: "14px", marginBottom: "14px" }}>
+848:             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "14px", flexWrap: "wrap" }}>
+849:               <div>
+850:                 <div style={{ color: palette.muted, fontSize: "15px", letterSpacing: "0.1em", textTransform: "uppercase" }}>

@@ -1,0 +1,35 @@
+              {signalVirtualizer.getVirtualItems().map((virtualRow) => {
+                const row = signalRows[virtualRow.index];
+                return (
+                  <button
+                    key={row.symbol}
+                    onClick={() => setSelectedSymbol(row.symbol)}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      height: `${virtualRow.size}px`,
+                      transform: `translateY(${virtualRow.start}px)`,
+                      display: "grid",
+                      gridTemplateColumns: "190px 1fr 120px 90px 120px",
+                      gap: "12px",
+                      alignItems: "center",
+                      padding: "0 10px",
+                      border: "none",
+                      borderBottom: "1px solid rgba(143, 164, 184, 0.08)",
+                      background: row.symbol === selectedSymbol ? "rgba(56, 189, 248, 0.08)" : "transparent",
+                      color: palette.text,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <strong style={{ textAlign: "left" }}>{formatSymbolLabel(row.symbol, row.name)}</strong>
+                    <span style={{ color: palette.muted, textAlign: "left" }}>
+                      {formatSectorLabel(row.sector)} | {row.label}
+                    </span>
+                    <span style={{ ...marketNumbers }}>{fmtPrice(row.last)}</span>
+                    <span style={{ ...marketNumbers, color: priceTone(row.changePct) }}>{fmtPct(row.changePct)}</span>
+                    <span style={{ ...marketNumbers, color: palette.volume }}>{fmtCompact(row.turnover)}</span>
+                  </button>
+                );
+              })}
