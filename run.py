@@ -415,6 +415,13 @@ async def main() -> None:
         use_mock=use_mock,
     )
 
+    if auto_trader is not None:
+        import datetime as _dt
+        _today = _dt.datetime.now(tz=_TZ_TW).strftime("%Y%m%d")
+        _restored = await auto_trader.restore_positions(_today)
+        if _restored:
+            logger.info("Restored %d open position(s) from today's DB snapshot", _restored)
+
     await collector.start()
     logger.info("Collector running on ws://%s:%d symbols=%d. Press Ctrl+C to stop.", ws_host, ws_port, len(symbols))
 

@@ -164,8 +164,9 @@ class AppSupervisor:
             try:
                 await self.notifier.start()
                 self._notifier_started = True
-            except Exception:
-                self._notifier_started = False
+            except Exception as exc:
+                await self.fail_closed(f"notifier_startup_failure:{exc}")
+                raise
 
             self.trading_gate_open = True
             self._set_state(LifecycleState.RUNNING)

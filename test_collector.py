@@ -246,7 +246,7 @@ async def test_soak_reconnect_and_cleanup() -> None:
     assert len(service.task_set) == 0, (
         f"Ghost tasks remain after stop: {len(service.task_set)}"
     )
-    assert mock_session.closed is True, "Session was not closed"
+    assert mock_session.closed is False, "注入的 session 不應由 CollectorService 關閉（ownership 在呼叫方）"
     assert ws_factory.connect_count > 1, (
         f"Expected reconnects but connect_count={ws_factory.connect_count}"
     )

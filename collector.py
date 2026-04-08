@@ -45,6 +45,7 @@ class CoalescingQueue:
         self._order: list[str] = []
         self._lock = asyncio.Lock()
         self._not_empty = asyncio.Event()
+        self.drop_count: int = 0
 
     async def put(self, symbol: str, data: Any) -> None:
         async with self._lock:
@@ -52,6 +53,13 @@ class CoalescingQueue:
                 self._data[symbol] = data
             else:
                 if len(self._data) >= self.maxsize:
+                    self.drop_count += 1
+                    logger.warning(
+                        "CoalescingQueue 已滿（上限 %d），丟棄 %s（累計丟棄 %d 筆）",
+                        self.maxsize,
+                        symbol,
+                        self.drop_count,
+                    )
                     return
                 self._data[symbol] = data
                 self._order.append(symbol)
@@ -284,12 +292,18 @@ class CollectorService:
         )
         self._news_collector.start()
 
-    async def stop(self) -> None:
+    async def stop_accepting(self) -> None:
+        """停止接受新資料（先停 WS/News，保留 queue 供消費端排水）。"""
         if self._ws_collector is not None:
             await self._ws_collector.stop()
         if self._news_collector is not None:
             await self._news_collector.stop()
+
+    def pending_count(self) -> int:
+        """回傳 queue 中尚未消費的 tick 數量。"""
+        return self.queue.qsize()
+
+    async def stop(self) -> None:
+        await self.stop_accepting()
         if self._session is not None and self._injected_session is None:
-            await self._session.close()
-        elif self._session is not None and self._injected_session is not None:
             await self._session.close()

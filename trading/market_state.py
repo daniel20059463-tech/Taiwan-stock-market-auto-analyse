@@ -64,11 +64,20 @@ class MarketState:
         bar.close = price
         bar.volume += volume
 
+    def reset_intraday(self) -> None:
+        """Clear per-day open prices and active bars; keep ATR/volume history."""
+        self._open_prices.clear()
+        self._current_bar.clear()
+
     def open_price(self, symbol: str) -> Optional[float]:
         return self._open_prices.get(symbol)
 
     def last_price(self, symbol: str) -> Optional[float]:
         return self._last_prices.get(symbol)
+
+    @property
+    def last_prices(self) -> dict[str, float]:
+        return self._last_prices
 
     def latest_bar(self, symbol: str) -> Optional[CandleBar]:
         return self._current_bar.get(symbol)

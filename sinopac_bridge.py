@@ -65,6 +65,9 @@ class SinopacCollector:
         self._dropped_ticks = 0
         self._flush_interval_seconds = max(0.05, flush_interval_ms / 1_000)
         self._taiex_prev_close: float = 0.0   # 加權指數前收（用於計算漲跌幅）
+        self._last_tick_monotonic: float = 0.0
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._reconnecting: bool = False
 
     def _get_contract_sync(self, symbol: str) -> Any | None:
         if self._api is None:
@@ -86,6 +89,8 @@ class SinopacCollector:
         if self._sentiment_consumer is not None:
             await self._sentiment_consumer.start()
         await self._loop.run_in_executor(None, self._login_and_subscribe_sync)
+        self._last_tick_monotonic = time.monotonic()
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop(), name="sinopac-watchdog")
         logger.info("SinopacCollector ready on ws://%s:%d symbols=%s", self._ws_host, self._ws_port, self._symbols)
 
     async def stop_accepting(self) -> None:
@@ -95,12 +100,13 @@ class SinopacCollector:
         self._accepting = False
         if self._sentiment_consumer is not None:
             await self._sentiment_consumer.stop()
-        if self._broadcast_task is not None and not self._broadcast_task.done():
-            self._broadcast_task.cancel()
-            try:
-                await self._broadcast_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._broadcast_task, self._watchdog_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -114,11 +120,57 @@ class SinopacCollector:
     def pending_count(self) -> int:
         return len(self._dirty_symbols)
 
+    async def _watchdog_loop(self) -> None:
+        """每 60 秒檢查一次：交易時段內超過 5 分鐘無 tick，自動重新登入並訂閱。"""
+        _CHECK_INTERVAL = 60.0
+        _TICK_TIMEOUT = 300.0  # 5 分鐘
+        try:
+            while self._accepting:
+                await asyncio.sleep(_CHECK_INTERVAL)
+                if not self._accepting or self._reconnecting:
+                    continue
+                now_tw = datetime.datetime.now(tz=_TZ_TW)
+                t = now_tw.hour * 60 + now_tw.minute
+                if not (_MARKET_OPEN_MIN <= t <= _MARKET_CLOSE_MIN):
+                    continue
+                elapsed = time.monotonic() - self._last_tick_monotonic
+                if elapsed < _TICK_TIMEOUT:
+                    continue
+                logger.warning(
+                    "交易時段內 %.0f 秒無 tick，重新連線永豐 API…", elapsed
+                )
+                loop = self._loop
+                if loop is None:
+                    continue
+                try:
+                    await loop.run_in_executor(None, self._reconnect_sync)
+                    logger.info("永豐 API 重新連線成功")
+                except Exception as exc:
+                    logger.error("永豐 API 重新連線失敗: %s", exc)
+        except asyncio.CancelledError:
+            return
+
+    def _reconnect_sync(self) -> None:
+        """斷線重連：登出舊 API → 重新 login + subscribe。"""
+        self._reconnecting = True
+        try:
+            if self._api is not None:
+                try:
+                    self._api.logout()
+                except Exception:
+                    pass
+                self._api = None
+            self._login_and_subscribe_sync()
+            self._last_tick_monotonic = time.monotonic()
+        finally:
+            self._reconnecting = False
+
     def _offer_tick(self, payload: dict[str, Any]) -> None:
         symbol = str(payload.get("symbol", ""))
         if not symbol:
             self._dropped_ticks += 1
             return
+        self._last_tick_monotonic = time.monotonic()
         self._current_ticks[symbol] = payload
         self._dirty_symbols.add(symbol)
         if self._tick_event is not None:
