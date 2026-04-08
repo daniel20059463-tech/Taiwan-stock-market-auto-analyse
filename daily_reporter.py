@@ -45,18 +45,18 @@ class OpenAIDailyReportLLM:
 
     def summarize_trade(self, payload: dict[str, Any]) -> str:
         prompt = (
-            "請用繁體中文寫 1 到 2 句交易檢討短評，重點放在這筆交易為什麼做、"
-            "多空辯論最後哪一方比較合理，以及這筆單成功或失敗的核心原因。"
-            "請精簡、可直接貼到 Telegram。\n\n"
+            "請用 1 到 2 句中文說明這筆交易。重點放在進出場理由、"
+            "正反觀點哪一邊最後被市場證明較合理，以及這筆交易最值得記住的教訓。"
+            "內容會直接發到 Telegram，請保持精簡。\n\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
         return self._responses_text(prompt)
 
     def summarize_day(self, payload: dict[str, Any]) -> str:
         prompt = (
-            "請用繁體中文撰寫一則適合 Telegram 的盤後日報。"
-            "請先做今日整體總結，再整理 2 到 3 點明日觀察方向。"
-            "語氣要專業、清楚、精簡，不要使用表格。\n\n"
+            "請把以下資料整理成一則中文 Telegram 盤後日報。"
+            "內容要包含今日總結、損益、勝率、風控狀態，以及 2 到 3 筆重點交易觀察。"
+            "語氣務實、簡潔、可直接閱讀，不要寫成長篇報告。\n\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
         return self._responses_text(prompt)
@@ -78,10 +78,10 @@ class OpenAIDailyReportLLM:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:  # pragma: no cover - exercised by runtime config
+        except urllib.error.HTTPError as exc:  # pragma: no cover
             body = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"openai_http_error:{exc.code}:{body}") from exc
-        except urllib.error.URLError as exc:  # pragma: no cover - exercised by runtime config
+        except urllib.error.URLError as exc:  # pragma: no cover
             raise RuntimeError(f"openai_network_error:{exc.reason}") from exc
 
         text = payload.get("output_text")
@@ -198,28 +198,29 @@ class DailyReporter:
         win_rate = float(day_payload.get("winRate", 0.0) or 0.0)
         total_pnl = float(day_payload.get("totalPnl", 0.0) or 0.0)
         risk = dict(day_payload.get("riskStatus") or {})
-        risk_label = "正常" if not risk.get("isHalted") and not risk.get("isWeeklyHalted") else "已觸發限制"
+        risk_label = "正常" if not risk.get("isHalted") and not risk.get("isWeeklyHalted") else "已停用"
         lines = [
             f"**盤後日報｜{date}**",
             "模板摘要",
+            "今日總結",
             f"今日總交易數：{trade_count}",
             f"勝率：{win_rate:.1f}%",
-            f"總損益：{total_pnl:+,.0f} 元",
+            f"總損益：{total_pnl:+,.0f}",
             f"風控狀態：{risk_label}",
         ]
         if highlights:
-            lines.append("重點檢討：")
+            lines.append("重點交易")
             for trade in highlights:
                 symbol = trade.get("symbol", "--")
                 reason = trade.get("reason", "--")
                 pnl = float(trade.get("netPnl", trade.get("pnl", 0.0)) or 0.0)
-                lines.append(f"- {symbol} {reason}，損益 {pnl:+,.0f} 元")
+                lines.append(f"- {symbol} {reason}，損益 {pnl:+,.0f}")
         return "\n".join(lines)
 
     def clamp_telegram_text(self, text: str) -> str:
         if len(text) <= self.max_length:
             return text
-        suffix = "\n…（訊息已截斷）"
+        suffix = "\n內容已截斷。"
         room = max(0, self.max_length - len(suffix))
         return text[:room] + suffix
 
@@ -235,7 +236,7 @@ class DailyReporter:
 
         lines = [report_text]
         if highlight_summaries:
-            lines.extend(["", "重點交易：", *[f"- {summary}" for summary in highlight_summaries]])
+            lines.extend(["", "重點短評", *[f"- {summary}" for summary in highlight_summaries]])
         merged = "\n".join(lines)
         if "盤後日報" not in merged:
             merged = f"**盤後日報｜{day_payload.get('date', '--')}**\n{merged}"
@@ -249,14 +250,21 @@ def telegram_sender_from_env(*, bot_token: str, timeout_seconds: float = 10.0) -
             "text": text,
             "parse_mode": parse_mode,
         }
-        request = urllib.request.Request(
-            url=f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            method="POST",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload).encode("utf-8"),
-        )
-        with urllib.request.urlopen(request, timeout=timeout_seconds):
-            pass
+        import time
+
+        for attempt in range(1, 4):
+            try:
+                request = urllib.request.Request(
+                    url=f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps(payload).encode("utf-8"),
+                )
+                with urllib.request.urlopen(request, timeout=timeout_seconds):
+                    break
+            except (urllib.error.URLError, TimeoutError):
+                if attempt < 3:
+                    time.sleep(2 ** (attempt - 1))
 
     return _send
 
@@ -286,4 +294,3 @@ def daily_reporter_from_env() -> DailyReporter | None:
         telegram_sender=telegram_sender_from_env(bot_token=bot_token),
         llm_client=llm_client_from_env(),
     )
-

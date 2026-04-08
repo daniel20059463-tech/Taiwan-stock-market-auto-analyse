@@ -41,6 +41,10 @@ class AnalystContext:
     opposing_factors: list[dict[str, str]] = field(default_factory=list)
     entry_price: float | None = None
     current_price: float | None = None
+    portfolio_positions_count: int = 0
+    portfolio_unrealized_pnl: float = 0.0
+    portfolio_daily_win_rate: float = 0.0
+    portfolio_risk_budget_used_pct: float = 0.0
 
 
 @dataclass
@@ -84,11 +88,11 @@ class NewsAnalyst:
         )
         support: list[AnalystFactor] = []
         if has_news:
-            support.append(AnalystFactor("事件催化", f"偵測到新聞事件 {article_id}，具備短線催化條件。"))
-            summary = "新聞分析認為事件仍在時效內，適合納入盤中判斷。"
+            support.append(AnalystFactor("事件來源", f"已取得新聞事件，article_id={article_id}"))
+            summary = "新聞分析認為目前事件具備方向性資訊，可作為決策依據。"
         else:
-            support.append(AnalystFactor("事件背景", "目前沒有新的新聞事件，主要依賴盤面資料判讀。"))
-            summary = "新聞分析未發現新的催化來源，傾向作為中性背景。"
+            support.append(AnalystFactor("事件空窗", "目前沒有新的新聞事件，僅能依價格與量能判斷。"))
+            summary = "新聞分析未取得明確事件，判斷權重下降。"
         return AnalystView(
             agent_name=self.agent_name,
             stance=stance,
@@ -100,7 +104,7 @@ class NewsAnalyst:
 
 
 class SentimentAnalyst:
-    agent_name = "輿情分析"
+    agent_name = "情緒分析"
 
     def analyze(self, context: AnalystContext) -> AnalystView:
         score_value = context.sentiment_score or 0.0
@@ -108,18 +112,18 @@ class SentimentAnalyst:
         blocking = score_value < -0.2
         if score_value > 0.2:
             stance = "bullish"
-            summary = f"輿情分析偏多，情緒分數 {score_value:.3f} 對多方有利。"
-            support = [AnalystFactor("市場情緒", f"情緒分數 {score_value:.3f} 支持偏多解讀。")]
+            summary = f"情緒分析偏多，分數 {score_value:.3f}，支持順勢交易。"
+            support = [AnalystFactor("情緒分數", f"情緒分數 {score_value:.3f}，偏多。")]
             oppose: list[AnalystFactor] = []
         elif score_value < -0.2:
             stance = "bearish"
-            summary = f"輿情分析偏空，情緒分數 {score_value:.3f} 建議保守處理。"
+            summary = f"情緒分析偏空，分數 {score_value:.3f}，需提高警覺。"
             support = []
-            oppose = [AnalystFactor("市場情緒", f"情緒分數 {score_value:.3f} 顯示市場雜訊偏空。")]
+            oppose = [AnalystFactor("情緒分數", f"情緒分數 {score_value:.3f}，偏空。")]
         else:
             stance = "neutral"
-            summary = "輿情分析接近中性，暫時不單獨決定進出場。"
-            support = [AnalystFactor("情緒平衡", "情緒分數接近中性，需交由其他角色補強。")]
+            summary = "情緒分析中性，無法提供明顯方向。"
+            support = [AnalystFactor("情緒持平", "情緒分數接近中性，需依其他條件補強。")]
             oppose = []
         return AnalystView(
             agent_name=self.agent_name,
@@ -143,19 +147,38 @@ class TechnicalAnalyst:
 
         if abs(context.change_pct) >= 2:
             score += 18
-            support.append(AnalystFactor("價格動能", f"盤中漲跌幅 {context.change_pct:+.2f}% 代表動能已明顯展開。"))
+            support.append(AnalystFactor("波動強度", f"日內漲跌 {context.change_pct:+.2f}%，波動已展開。"))
         else:
-            oppose.append(AnalystFactor("動能不足", f"盤中漲跌幅 {context.change_pct:+.2f}% 尚未完全擴散。"))
+            oppose.append(AnalystFactor("波動不足", f"日內漲跌 {context.change_pct:+.2f}%，動能仍偏弱。"))
 
         if context.volume_confirmed:
             score += 16
-            support.append(AnalystFactor("量能確認", "成交量已達放量門檻，技術面支持事件延續。"))
+            support.append(AnalystFactor("量能確認", "成交量通過確認，價格變動較有可信度。"))
         else:
             score -= 12
-            oppose.append(AnalystFactor("量能不足", "價格有變化但量能沒有同步放大。"))
+            oppose.append(AnalystFactor("量能不足", "成交量未通過確認，訊號可靠度下降。"))
 
-        stance = "bullish" if context.decision_type in {"buy", "cover"} else "bearish" if context.decision_type in {"sell", "short"} else "neutral"
-        summary = "技術分析認為量價結構完整，可配合事件單執行。" if score >= 60 else "技術分析認為確認度有限，建議降低信心。"
+        if context.portfolio_unrealized_pnl < -5000:
+            score -= 8
+            oppose.append(
+                AnalystFactor(
+                    "組合浮虧偏重",
+                    f"帳本未實現損益 {context.portfolio_unrealized_pnl:+,.0f}，目前不宜過度擴張風險。",
+                )
+            )
+
+        stance = (
+            "bullish"
+            if context.decision_type in {"buy", "cover"}
+            else "bearish"
+            if context.decision_type in {"sell", "short"}
+            else "neutral"
+        )
+        summary = (
+            "技術分析給出偏正向的確認。"
+            if score >= 60
+            else "技術分析訊號尚未完全成立。"
+        )
         return AnalystView(
             agent_name=self.agent_name,
             stance=stance,
@@ -171,22 +194,54 @@ class RiskAnalyst:
 
     def analyze(self, context: AnalystContext) -> AnalystView:
         score = 70 if context.risk_allowed else 20
-        support = [AnalystFactor("風控狀態", context.risk_reason)]
+        support = [AnalystFactor("風控判斷", context.risk_reason)]
         oppose: list[AnalystFactor] = []
+        blocking = not context.risk_allowed
+
         if context.market_change_pct <= -1.5:
             score -= 18
-            oppose.append(AnalystFactor("大盤壓力", f"加權指數 {context.market_change_pct:+.2f}% 代表市場承壓。"))
+            oppose.append(AnalystFactor("大盤壓力", f"大盤變動 {context.market_change_pct:+.2f}%，市場風險升高。"))
         if context.risk_flags:
             oppose.extend(AnalystFactor("風險旗標", flag) for flag in context.risk_flags)
-        summary = "風控分析允許進場，但需要嚴守停損與部位限制。" if context.risk_allowed else "風控分析不建議進場，需先等待風險解除。"
+
+        if context.portfolio_positions_count >= 4:
+            score -= 10
+            oppose.append(
+                AnalystFactor(
+                    "持倉接近上限",
+                    f"目前持倉 {context.portfolio_positions_count} 檔，新增部位會拉高整體風險。",
+                )
+            )
+        if context.portfolio_risk_budget_used_pct >= 0.8:
+            blocking = True
+            oppose.append(
+                AnalystFactor(
+                    "風控預算耗盡",
+                    f"風險預算使用率 {context.portfolio_risk_budget_used_pct:.0%}，不宜再開新部位。",
+                )
+            )
+        elif context.portfolio_risk_budget_used_pct >= 0.5:
+            score -= 15
+            oppose.append(
+                AnalystFactor(
+                    "風控預算過半",
+                    f"風險預算使用率 {context.portfolio_risk_budget_used_pct:.0%}，需降低積極度。",
+                )
+            )
+
+        summary = (
+            "風控分析允許進場。"
+            if context.risk_allowed and not blocking
+            else "風控分析不建議進場。"
+        )
         return AnalystView(
             agent_name=self.agent_name,
-            stance="bullish" if context.risk_allowed else "bearish",
+            stance="bullish" if context.risk_allowed and not blocking else "bearish",
             score=max(0, min(100, score)),
             summary=summary,
             supporting_factors=support,
             opposing_factors=oppose,
-            blocking=not context.risk_allowed,
+            blocking=blocking,
             metadata={"riskFlags": list(context.risk_flags)},
         )
 
@@ -199,14 +254,14 @@ class BullResearcher:
                 factor = view.supporting_factors[0].detail if view.supporting_factors else view.summary
                 points.append(factor)
         if context.volume_confirmed:
-            points.append("量能有跟上，短線追價的勝率提升。")
+            points.append("量能已確認，市場對這個方向至少有短線共識。")
         if context.decision_type == "buy":
-            conclusion = "多方主張先搶小部位，等事件擴散後再觀察是否加碼。"
+            conclusion = "綜合判斷偏向做多。"
         elif context.decision_type == "cover":
-            conclusion = "多方認為主要跌段已完成，回補空單可以保住已實現利潤。"
+            conclusion = "綜合判斷偏向回補空單。"
         else:
-            conclusion = "多方主張目前不急著反手，先觀察多頭是否還有延續。"
-        return f"多方論點：{'；'.join(points) if points else '目前多方缺乏明確優勢。'} {conclusion}"
+            conclusion = "多方論點存在，但不一定足以主導最終決策。"
+        return f"多方論點：{'；'.join(points) if points else '目前缺乏強而有力的多方理由。'} {conclusion}"
 
 
 class BearResearcher:
@@ -217,35 +272,41 @@ class BearResearcher:
                 factor = view.opposing_factors[0].detail if view.opposing_factors else view.summary
                 points.append(factor)
         if not context.volume_confirmed:
-            points.append("量能沒有同步擴大，容易出現假突破。")
+            points.append("量能不足，訊號延續性不高。")
         if context.market_change_pct <= 0:
-            points.append(f"大盤變化 {context.market_change_pct:+.2f}% ，整體環境不夠友善。")
+            points.append(f"大盤變動 {context.market_change_pct:+.2f}%，市場背景不利。")
         if context.decision_type == "short":
-            conclusion = "空方觀點認為利空事件與盤中轉弱已形成有效放空視窗。"
+            conclusion = "綜合判斷偏向放空。"
         elif context.decision_type == "cover":
-            conclusion = "空方提醒若過早回補可能錯過後續跌段，需確認主跌段已完成。"
+            conclusion = "綜合判斷偏向先回補，避免風險反轉。"
         else:
-            conclusion = "空方提醒不要因為單一事件忽略回落與洗盤風險。"
-        return f"空方論點：{'；'.join(points) if points else '目前空方缺乏足夠證據。'} {conclusion}"
+            conclusion = "空方疑慮仍在，必須保留反向風險。"
+        return f"空方論點：{'；'.join(points) if points else '目前缺乏強而有力的空方理由。'} {conclusion}"
 
 
 class DebateReferee:
-    def decide(self, context: AnalystContext, views: list[AnalystView], bull_argument: str, bear_argument: str) -> DebateResult:
+    def decide(
+        self,
+        context: AnalystContext,
+        views: list[AnalystView],
+        bull_argument: str,
+        bear_argument: str,
+    ) -> DebateResult:
         bull_score = sum(view.score for view in views if view.stance == "bullish")
         bear_score = sum(view.score for view in views if view.stance == "bearish" or view.blocking)
 
         if any(view.blocking for view in views):
             winner = "bear"
-            verdict = "裁決結論：風控或輿情已出現阻擋訊號，先不執行新的事件單。"
+            verdict = "裁決結論：風控或反向條件已構成阻擋，偏向保守處理。"
         elif bull_score > bear_score + 10:
             winner = "bull"
-            verdict = "裁決結論：多方證據較完整，可執行小部位搶快單，但仍要嚴守停損。"
+            verdict = "裁決結論：多方理由較完整，支持目前決策方向。"
         elif bear_score > bull_score + 10:
             winner = "bear"
-            verdict = "裁決結論：空方顧慮偏多，暫時以觀察或減碼為主。"
+            verdict = "裁決結論：空方理由較強，需優先重視風險。"
         else:
             winner = "tie"
-            verdict = "裁決結論：多空證據接近，若要交易也應縮小部位並提高警戒。"
+            verdict = "裁決結論：正反理由接近，代表信心不足，應控制倉位。"
 
         return DebateResult(
             bull_argument=bull_argument,
@@ -275,13 +336,13 @@ class DecisionComposer:
             factor.detail
             for view in positive_views
             for factor in (view.supporting_factors[:1] or [AnalystFactor(view.agent_name, view.summary)])
-        ) or "目前沒有足夠的多方優勢。"
+        ) or "目前沒有足夠的多方支持。"
         bear_points = "；".join(
             factor.detail
             for view in negative_views
             for factor in (view.opposing_factors[:1] or [AnalystFactor(view.agent_name, view.summary)])
-        ) or "目前沒有明顯的空方壓力。"
-        risk_points = "；".join(view.summary for view in views if view.agent_name == "風控分析") or "風控分析尚未提供額外限制。"
+        ) or "目前沒有足夠的空方疑慮。"
+        risk_points = "；".join(view.summary for view in views if view.agent_name == "風控分析") or "風控分析未提供額外限制。"
 
         bull_argument = self._bull_researcher.argue(context, views)
         bear_argument = self._bear_researcher.argue(context, views)

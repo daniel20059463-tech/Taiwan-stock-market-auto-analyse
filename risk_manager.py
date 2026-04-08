@@ -1,21 +1,8 @@
 """
-risk_manager.py — 交易風險控制管理器
+Risk manager for paper trading.
 
-執行以下風控規則：
-  1. 每日最大虧損上限  ─ 帳戶資本 × MAX_DAILY_LOSS_PCT（預設 2%）
-  2. 最大同時持倉檔數  ─ MAX_POSITIONS（預設 5 檔）
-  3. 單一持倉資金上限  ─ 帳戶資本 × MAX_SINGLE_POSITION_PCT（預設 10%）
-  4. ATR 動態停損計算  ─ stop = entry - ATR_MULTIPLIER × ATR（預設 2.0 倍）
-     停損幅度限制在 [MIN_STOP_PCT, MAX_STOP_PCT] 之間（避免過鬆/過緊）
-  5. 停利目標維持至少 2:1 風報比
-  6. 交易成本計入損益  ─ 買進手續費 0.1425%、賣出手續費 0.1425% + 證交稅 0.3%
-  7. 5 日滾動損益追蹤  ─ 近 5 交易日累計虧損 >= 帳戶 5% 時暫停買入
-
-使用方式：
-    rm = RiskManager(account_capital=1_000_000)
-    allowed, reason = rm.can_buy("2330", price=900, shares=1000, current_positions=2)
-    if allowed:
-        rm.on_buy("2330", price=900, shares=1000)
+This module enforces daily loss limits, rolling drawdown limits, position caps,
+ATR-based stop calculation, and transaction-cost-aware net PnL.
 """
 from __future__ import annotations
 
@@ -26,38 +13,34 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── 預設風控參數 ──────────────────────────────────────────────────────────────
-MAX_DAILY_LOSS_PCT   = 2.0   # 每日最大虧損：帳戶 2%
-MAX_POSITIONS        = 5     # 最多同時持有 5 檔
-MAX_SINGLE_POS_PCT   = 10.0  # 單一持倉不超過帳戶 10%
-ATR_MULTIPLIER       = 2.0   # ATR 停損倍數
-MIN_STOP_PCT         = 1.5   # 最小停損幅度（%）—— 低波動股
-MAX_STOP_PCT         = 6.0   # 最大停損幅度（%）—— 高波動股
-RISK_REWARD_RATIO    = 2.0   # 最低風報比（停利 / 停損）
+MAX_DAILY_LOSS_PCT = 2.0
+MAX_POSITIONS = 5
+MAX_SINGLE_POS_PCT = 10.0
+ATR_MULTIPLIER = 2.0
+MIN_STOP_PCT = 1.5
+MAX_STOP_PCT = 6.0
+RISK_REWARD_RATIO = 2.0
 
-# ── 交易成本（台股）─────────────────────────────────────────────────────────
-TX_FEE_BUY_PCT    = 0.1425   # 買進手續費（%）
-TX_FEE_SELL_PCT   = 0.1425   # 賣出手續費（%）
-TX_TAX_SELL_PCT   = 0.3000   # 證交稅（%，僅賣出收取）
-TX_TOTAL_RT_PCT   = TX_FEE_BUY_PCT + TX_FEE_SELL_PCT + TX_TAX_SELL_PCT  # 來回 0.585%
+TX_FEE_BUY_PCT = 0.1425
+TX_FEE_SELL_PCT = 0.1425
+TX_TAX_SELL_PCT = 0.3000
+TX_TOTAL_RT_PCT = TX_FEE_BUY_PCT + TX_FEE_SELL_PCT + TX_TAX_SELL_PCT
 
-# ── 5 日滾動損益上限 ─────────────────────────────────────────────────────────
-ROLLING_5DAY_LOSS_PCT = 5.0  # 近 5 交易日累計虧損超過帳戶 5% → 暫停買入
+ROLLING_5DAY_LOSS_PCT = 5.0
+MAX_GLOBAL_DRAWDOWN_PCT = 15.0
 
 
 @dataclass
 class RiskState:
     daily_realized_pnl: float = 0.0
     daily_trade_count: int = 0
-    current_date: str = ""          # YYYY-MM-DD（台北時間）
-    daily_pnl_history: list = field(default_factory=list)  # [(date, net_pnl), ...] 最多 5 筆
+    current_date: str = ""
+    daily_pnl_history: list = field(default_factory=list)
+    peak_equity: float | None = None
 
 
 class RiskManager:
-    """
-    集中管理所有風控邏輯。AutoTrader 在買入/賣出前後呼叫此類方法。
-    所有方法為同步呼叫，可安全地在 asyncio 事件迴圈中使用。
-    """
+    """Stateful portfolio risk manager used by AutoTrader."""
 
     def __init__(
         self,
@@ -81,24 +64,22 @@ class RiskManager:
         self.min_stop_pct = min_stop_pct
         self.max_stop_pct = max_stop_pct
         self.risk_reward_ratio = risk_reward_ratio
+        self.max_global_drawdown_pct = MAX_GLOBAL_DRAWDOWN_PCT
 
         self._state = RiskState()
-
-    # ── 每日重置 ─────────────────────────────────────────────────────────────
+        self._state.peak_equity = account_capital
 
     def _check_date_reset(self) -> None:
-        """偵測台北時區日期變更，自動重置當日損益計數，並封存前日損益至 5 日歷史。"""
+        """Roll daily counters and keep a 5-day realized PnL window."""
         today = _today_tw()
         if self._state.current_date != today:
-            # 封存前日損益（current_date 非空才有資料）
             if self._state.current_date:
                 history = self._state.daily_pnl_history
                 history.append((self._state.current_date, self._state.daily_realized_pnl))
-                # 僅保留最近 5 個交易日
                 if len(history) > 5:
                     history.pop(0)
                 logger.info(
-                    "RiskManager: 新交易日 %s，前日 %s 損益 %.0f 元（%d 筆）存入 5 日歷史",
+                    "RiskManager: rolled date to %s, archived %s pnl=%.0f trades=%d",
                     today,
                     self._state.current_date,
                     self._state.daily_realized_pnl,
@@ -108,8 +89,6 @@ class RiskManager:
             self._state.daily_trade_count = 0
             self._state.current_date = today
 
-    # ── 買入前審核 ────────────────────────────────────────────────────────────
-
     def can_buy(
         self,
         symbol: str,
@@ -117,59 +96,51 @@ class RiskManager:
         shares: int,
         current_positions: int,
     ) -> tuple[bool, str]:
-        """
-        審核是否允許買入。
-        回傳 (allowed: bool, reason: str)。
-        reason 在 allowed=False 時說明拒絕原因。
-        """
+        """Check whether a new position is allowed under current risk constraints."""
         self._check_date_reset()
 
-        # 規則 1：每日最大虧損上限
         if self._state.daily_realized_pnl <= -self.max_daily_loss:
             return False, (
-                f"每日虧損上限已達 {self._state.daily_realized_pnl:,.0f} 元"
-                f"（上限 -{self.max_daily_loss:,.0f} 元）"
+                f"今日已實現損益 {self._state.daily_realized_pnl:,.0f}，"
+                f"已超過每日損失限制 -{self.max_daily_loss:,.0f}。"
             )
 
-        # 規則 1b：5 日滾動虧損上限
         if self.rolling_5day_pnl <= -self.max_rolling_loss:
             return False, (
-                f"近 5 日滾動虧損 {self.rolling_5day_pnl:,.0f} 元"
-                f" 超過上限 -{self.max_rolling_loss:,.0f} 元，暫停買入"
+                f"近五日損益 {self.rolling_5day_pnl:,.0f}，"
+                f"已超過限制 -{self.max_rolling_loss:,.0f}，暫停新單。"
             )
 
-        # 規則 2：最大同時持倉檔數
-        if current_positions >= self.max_positions:
-            return False, f"持倉已達上限 {self.max_positions} 檔"
+        current_dd_pct = self.current_drawdown_pct
+        if current_dd_pct >= self.max_global_drawdown_pct:
+            return False, (
+                f"目前回撤 {current_dd_pct:.2f}% ，"
+                f"已超過 {self.max_global_drawdown_pct:.1f}% 上限，停止開倉。"
+            )
 
-        # 規則 3：單一持倉資金上限
+        if current_positions >= self.max_positions:
+            return False, f"持倉檔數已達上限 {self.max_positions}。"
+
         position_cost = price * shares
         if position_cost > self.max_single_position:
             return False, (
-                f"單一持倉成本 {position_cost:,.0f} 元"
-                f" 超過上限 {self.max_single_position:,.0f} 元"
+                f"單筆部位金額 {position_cost:,.0f}，"
+                f"超過上限 {self.max_single_position:,.0f}。"
             )
 
         return True, "OK"
 
-    # ── ATR 動態停損計算 ──────────────────────────────────────────────────────
-
     def calc_stop_price(self, entry_price: float, atr: Optional[float]) -> float:
-        """
-        以 ATR 計算停損價格。
-        停損幅度：atr_multiplier × ATR，但限制在 [min_stop_pct, max_stop_pct]。
-        若 ATR 不可用，退回固定停損（min + max 的中間值）。
-        """
+        """Calculate a bounded ATR stop price."""
         if atr is not None and atr > 0:
             raw_stop_pct = self.atr_multiplier * atr / entry_price * 100
             stop_pct = max(self.min_stop_pct, min(self.max_stop_pct, raw_stop_pct))
         else:
-            # 無 ATR 時使用固定中間值
             stop_pct = (self.min_stop_pct + self.max_stop_pct) / 2
 
         stop_price = entry_price * (1 - stop_pct / 100)
         logger.debug(
-            "calc_stop_price: entry=%.2f atr=%s stop_pct=%.2f%% → stop=%.2f",
+            "calc_stop_price: entry=%.2f atr=%s stop_pct=%.2f%% stop=%.2f",
             entry_price,
             f"{atr:.4f}" if atr else "N/A",
             stop_pct,
@@ -178,66 +149,63 @@ class RiskManager:
         return round(stop_price, 2)
 
     def calc_target_price(self, entry_price: float, stop_price: float) -> float:
-        """
-        停利目標 = entry + risk × risk_reward_ratio（維持 2:1 風報比）。
-        """
+        """Calculate a reward target using the configured risk/reward ratio."""
         risk = entry_price - stop_price
         target = entry_price + risk * self.risk_reward_ratio
         return round(target, 2)
 
-    # ── 交易後更新 ────────────────────────────────────────────────────────────
-
     def on_buy(self, symbol: str, price: float, shares: int) -> None:
         self._check_date_reset()
         self._state.daily_trade_count += 1
-        logger.debug("RiskManager.on_buy: %s @ %.2f × %d", symbol, price, shares)
+        logger.debug("RiskManager.on_buy: %s @ %.2f x %d", symbol, price, shares)
 
     def on_sell(self, symbol: str, pnl: float) -> None:
         self._check_date_reset()
         self._state.daily_realized_pnl += pnl
+
+        current_eq = (
+            self.account_capital
+            + sum(h_pnl for _, h_pnl in self._state.daily_pnl_history)
+            + self._state.daily_realized_pnl
+        )
+        if self._state.peak_equity is None or current_eq > self._state.peak_equity:
+            self._state.peak_equity = current_eq
+
         logger.info(
-            "RiskManager.on_sell: %s pnl=%.0f 今日累計=%.0f 元",
+            "RiskManager.on_sell: %s pnl=%.0f daily=%.0f current_mdd=%.2f%%",
             symbol,
             pnl,
             self._state.daily_realized_pnl,
+            self.current_drawdown_pct,
         )
-
-    # ── 交易成本計算 ──────────────────────────────────────────────────────────
 
     def calc_net_pnl(
         self, entry_price: float, sell_price: float, shares: int
     ) -> float:
-        """
-        計算扣除台股交易成本後的淨損益。
-          買進手續費：entry_price × shares × 0.1425%
-          賣出手續費：sell_price × shares × 0.1425%
-          賣出證交稅：sell_price × shares × 0.3%
-        """
+        """Calculate round-trip net PnL after fees and sell-side tax."""
         gross_pnl = (sell_price - entry_price) * shares
-        buy_fee  = entry_price * shares * TX_FEE_BUY_PCT / 100
-        sell_fee = sell_price  * shares * (TX_FEE_SELL_PCT + TX_TAX_SELL_PCT) / 100
-        net_pnl  = gross_pnl - buy_fee - sell_fee
+        buy_fee = entry_price * shares * TX_FEE_BUY_PCT / 100
+        sell_fee = sell_price * shares * (TX_FEE_SELL_PCT + TX_TAX_SELL_PCT) / 100
+        net_pnl = gross_pnl - buy_fee - sell_fee
         logger.debug(
-            "calc_net_pnl: gross=%.0f buy_fee=%.0f sell_fee=%.0f → net=%.0f",
-            gross_pnl, buy_fee, sell_fee, net_pnl,
+            "calc_net_pnl: gross=%.0f buy_fee=%.0f sell_fee=%.0f net=%.0f",
+            gross_pnl,
+            buy_fee,
+            sell_fee,
+            net_pnl,
         )
         return round(net_pnl, 2)
 
-    # ── 狀態查詢 ─────────────────────────────────────────────────────────────
-
     @property
     def rolling_5day_pnl(self) -> float:
-        """近 5 個交易日（已封存）的淨損益總和，不含今日。"""
         return sum(pnl for _, pnl in self._state.daily_pnl_history)
 
     @property
     def is_weekly_halted(self) -> bool:
-        """近 5 日滾動虧損達上限，應暫停買入。"""
         return self.rolling_5day_pnl <= -self.max_rolling_loss
 
     @property
     def is_halted(self) -> bool:
-        """今日虧損已達上限，應暫停全部買入。"""
         self._check_date_reset()
         return self._state.daily_realized_pnl <= -self.max_daily_loss
 
@@ -249,8 +217,21 @@ class RiskManager:
     def daily_trade_count(self) -> int:
         return self._state.daily_trade_count
 
+    @property
+    def current_drawdown_pct(self) -> float:
+        if self._state.peak_equity is None or self._state.peak_equity <= 0:
+            return 0.0
+        current_eq = (
+            self.account_capital
+            + sum(h_pnl for _, h_pnl in self._state.daily_pnl_history)
+            + self._state.daily_realized_pnl
+        )
+        if current_eq >= self._state.peak_equity:
+            return 0.0
+        return (self._state.peak_equity - current_eq) / self._state.peak_equity * 100.0
+
     def status_dict(self) -> dict:
-        """回傳風控狀態摘要，供前端或 Telegram 顯示。"""
+        """Return a serializable summary for UI, logs, or Telegram."""
         self._check_date_reset()
         return {
             "date": self._state.current_date,
@@ -260,14 +241,13 @@ class RiskManager:
             "rolling5DayPnl": round(self.rolling_5day_pnl, 0),
             "rolling5DayLimit": round(-self.max_rolling_loss, 0),
             "isWeeklyHalted": self.is_weekly_halted,
+            "currentDrawdownPct": round(self.current_drawdown_pct, 2),
             "dailyTradeCount": self._state.daily_trade_count,
             "maxPositions": self.max_positions,
             "maxSinglePosition": round(self.max_single_position, 0),
             "txCostRoundtripPct": TX_TOTAL_RT_PCT,
         }
 
-
-# ── 工具函式 ──────────────────────────────────────────────────────────────────
 
 def _today_tw() -> str:
     tz_tw = datetime.timezone(datetime.timedelta(hours=8))
@@ -276,5 +256,6 @@ def _today_tw() -> str:
 
 def risk_manager_from_env() -> RiskManager:
     import os
+
     capital = float(os.getenv("ACCOUNT_CAPITAL", "1000000"))
     return RiskManager(account_capital=capital)

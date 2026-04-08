@@ -113,7 +113,7 @@ async def test_short_entry_creates_short_position_and_trade_record() -> None:
     assert _SHORT_SYMBOL in trader._positions
     position = trader._positions[_SHORT_SYMBOL]
     assert position.side == "short"
-    assert position.entry_price == _SHORT_PRICE
+    assert position.entry_price == round(_SHORT_PRICE * 0.9995, 2)
 
     snapshot = trader.get_portfolio_snapshot()
     last_trade = snapshot["recentTrades"][-1]

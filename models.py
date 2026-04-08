@@ -32,7 +32,9 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
+    delete,
     func,
     select,
 )
@@ -253,6 +255,242 @@ async def save_paper_trade(
     session.add(record)
     await session.flush()
     return record
+
+
+class PaperPositionSnapshot(Base):
+    """
+    活躍模擬持倉快照（Paper Position）。
+
+    每次開倉時 UPSERT、平倉時 DELETE。
+    重啟後透過 load_today_positions() 依 trade_date 過濾恢復同日持倉。
+
+    trade_date：格式 YYYYMMDD，用於確保僅恢復同日持倉。
+    """
+
+    __tablename__ = "paper_positions"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "symbol", name="uq_paper_pos_date_symbol"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    trade_date: Mapped[str] = mapped_column(String(8), nullable=False, index=True)  # YYYYMMDD
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    side: Mapped[str] = mapped_column(String(10), nullable=False)                    # long | short
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)
+    entry_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    entry_change_pct: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    stop_price: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    target_price: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    peak_price: Mapped[Decimal] = mapped_column(
+        Numeric(12, 4), nullable=False, default=Decimal("0")
+    )
+    trail_stop_price: Mapped[Decimal] = mapped_column(
+        Numeric(12, 4), nullable=False, default=Decimal("0")
+    )
+    entry_atr: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+async def upsert_paper_position(
+    session: AsyncSession,
+    *,
+    trade_date: str,
+    symbol: str,
+    side: str,
+    entry_price: float,
+    shares: int,
+    entry_ts: int,
+    entry_change_pct: float,
+    stop_price: float,
+    target_price: float,
+    peak_price: float = 0.0,
+    trail_stop_price: float = 0.0,
+    entry_atr: float | None = None,
+) -> PaperPositionSnapshot:
+    """
+    新增或更新活躍持倉快照。(trade_date, symbol) 唯一。
+    呼叫者應在外部 session.begin() context 內呼叫此函式。
+    """
+    stmt = select(PaperPositionSnapshot).where(
+        PaperPositionSnapshot.trade_date == trade_date,
+        PaperPositionSnapshot.symbol == symbol,
+    )
+    result = await session.execute(stmt)
+    existing = result.scalar_one_or_none()
+
+    if existing is not None:
+        existing.side = side
+        existing.entry_price = Decimal(str(round(entry_price, 4)))
+        existing.shares = shares
+        existing.entry_ts = entry_ts
+        existing.entry_change_pct = Decimal(str(round(entry_change_pct, 4)))
+        existing.stop_price = Decimal(str(round(stop_price, 4)))
+        existing.target_price = Decimal(str(round(target_price, 4)))
+        existing.peak_price = Decimal(str(round(peak_price, 4)))
+        existing.trail_stop_price = Decimal(str(round(trail_stop_price, 4)))
+        existing.entry_atr = Decimal(str(round(entry_atr, 6))) if entry_atr is not None else None
+        await session.flush()
+        return existing
+
+    snapshot = PaperPositionSnapshot(
+        trade_date=trade_date,
+        symbol=symbol,
+        side=side,
+        entry_price=Decimal(str(round(entry_price, 4))),
+        shares=shares,
+        entry_ts=entry_ts,
+        entry_change_pct=Decimal(str(round(entry_change_pct, 4))),
+        stop_price=Decimal(str(round(stop_price, 4))),
+        target_price=Decimal(str(round(target_price, 4))),
+        peak_price=Decimal(str(round(peak_price, 4))),
+        trail_stop_price=Decimal(str(round(trail_stop_price, 4))),
+        entry_atr=Decimal(str(round(entry_atr, 6))) if entry_atr is not None else None,
+    )
+    session.add(snapshot)
+    await session.flush()
+    return snapshot
+
+
+async def delete_paper_position(
+    session: AsyncSession,
+    *,
+    trade_date: str,
+    symbol: str,
+) -> None:
+    """
+    平倉後刪除對應的活躍持倉快照。
+    呼叫者應在外部 session.begin() context 內呼叫此函式。
+    """
+    stmt = delete(PaperPositionSnapshot).where(
+        PaperPositionSnapshot.trade_date == trade_date,
+        PaperPositionSnapshot.symbol == symbol,
+    )
+    await session.execute(stmt)
+
+
+async def load_today_positions(
+    session: AsyncSession,
+    *,
+    trade_date: str,
+) -> list[dict]:
+    """
+    讀取指定交易日的所有活躍持倉快照，回傳 dict 列表供 AutoTrader 重建 PaperPosition。
+    """
+    stmt = select(PaperPositionSnapshot).where(
+        PaperPositionSnapshot.trade_date == trade_date
+    )
+    result = await session.execute(stmt)
+    rows = result.scalars().all()
+    return [
+        {
+            "symbol": r.symbol,
+            "side": r.side,
+            "entry_price": float(r.entry_price),
+            "shares": r.shares,
+            "entry_ts": r.entry_ts,
+            "entry_change_pct": float(r.entry_change_pct),
+            "stop_price": float(r.stop_price),
+            "target_price": float(r.target_price),
+            "peak_price": float(r.peak_price),
+            "trail_stop_price": float(r.trail_stop_price),
+            "entry_atr": float(r.entry_atr) if r.entry_atr is not None else None,
+        }
+        for r in rows
+    ]
+
+
+class StrategyParamLog(Base):
+    """
+    策略參數調整歷史紀錄。
+
+    由 StrategyTuner 每日 EOD 後寫入，記錄每次參數變更的前後值與原因。
+    供事後審計與回溯分析使用。
+    """
+
+    __tablename__ = "strategy_param_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    param_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    old_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    new_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    trade_count_basis: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+async def save_param_log(
+    session: AsyncSession,
+    *,
+    param_name: str,
+    old_value: float,
+    new_value: float,
+    reason: str,
+    trade_count_basis: int = 0,
+) -> StrategyParamLog:
+    """
+    記錄一筆策略參數調整。
+    呼叫者應在外部 session.begin() context 內呼叫此函式。
+    """
+    record = StrategyParamLog(
+        param_name=param_name,
+        old_value=Decimal(str(round(old_value, 4))),
+        new_value=Decimal(str(round(new_value, 4))),
+        reason=reason,
+        trade_count_basis=trade_count_basis,
+    )
+    session.add(record)
+    await session.flush()
+    return record
+
+
+async def load_closed_trades(
+    session: AsyncSession,
+    *,
+    days: int = 30,
+) -> list[dict]:
+    """
+    讀取近 N 日的已平倉交易紀錄（action IN SELL, COVER），供 StrategyTuner 分析使用。
+    """
+    from datetime import timedelta
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+    stmt = (
+        select(PaperTrade)
+        .where(
+            PaperTrade.action.in_(["SELL", "COVER"]),
+            PaperTrade.created_at >= cutoff,
+        )
+        .order_by(PaperTrade.created_at)
+    )
+    result = await session.execute(stmt)
+    rows = result.scalars().all()
+    return [
+        {
+            "symbol": r.symbol,
+            "action": r.action,
+            "price": float(r.price),
+            "shares": r.shares,
+            "reason": r.reason,
+            "pnl": float(r.pnl),
+            "gross_pnl": float(r.gross_pnl),
+            "stop_price": float(r.stop_price),
+            "target_price": float(r.target_price),
+            "trade_ts_ms": r.trade_ts_ms,
+        }
+        for r in rows
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

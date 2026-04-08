@@ -6,6 +6,9 @@ import types
 import pytest
 
 from auto_trader import AutoTrader
+from trading import DecisionFactor as TradingDecisionFactor
+from trading import DecisionReport as TradingDecisionReport
+from trading.decision_reports import DecisionFactor, DecisionReport
 
 
 class _FakeRiskManager:
@@ -72,6 +75,48 @@ class _FakeDailyReporter:
     def build_and_send(self, *, day_payload: dict[str, object]) -> object:
         self.calls.append(day_payload)
         return {"text": "ok"}
+
+
+def test_decision_reports_are_exported_and_serialized() -> None:
+    factor = DecisionFactor(kind="support", label="trend", detail="price is rising")
+    report = DecisionReport(
+        report_id="abc-123",
+        symbol="2330",
+        ts=1_775_500_400_000,
+        decision_type="buy",
+        trigger_type="mixed",
+        confidence=88,
+        final_reason="fast_entry_confirmed",
+        summary="example",
+        supporting_factors=[factor],
+        opposing_factors=[],
+        risk_flags=["tight_stop"],
+        source_events=[{"source": "price_momentum"}],
+        order_result={"status": "executed"},
+        bull_case="bull",
+        bear_case="bear",
+        risk_case="risk",
+        bull_argument="bull arg",
+        bear_argument="bear arg",
+        referee_verdict="verdict",
+        debate_winner="bull",
+    )
+
+    assert TradingDecisionFactor is DecisionFactor
+    assert TradingDecisionReport is DecisionReport
+
+    data = report.to_dict()
+    assert data["reportId"] == "abc-123"
+    assert data["supportingFactors"] == [
+        {"kind": "support", "label": "trend", "detail": "price is rising"}
+    ]
+    assert data["bullCase"] == "bull"
+    assert data["bearCase"] == "bear"
+    assert data["riskCase"] == "risk"
+    assert data["bullArgument"] == "bull arg"
+    assert data["bearArgument"] == "bear arg"
+    assert data["refereeVerdict"] == "verdict"
+    assert data["debateWinner"] == "bull"
 
 
 @pytest.mark.asyncio
