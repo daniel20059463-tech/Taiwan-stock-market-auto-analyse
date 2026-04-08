@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib
+import inspect
 import json
 import logging
 import os
 import random
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
 
+from main import SharedMemoryIPC, create_supervisor_from_runtime
 from market_universe import DEFAULT_TW_SYMBOLS
 
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
@@ -32,6 +35,112 @@ _MOCK_BASE: dict[str, float] = {
     "2382": 245.0,
     "2412": 128.0,
 }
+
+
+@dataclass(slots=True)
+class RuntimeComponents:
+    state_store: Any
+    analyzer: Any
+    collector: Any
+    notifier: Any
+    ipc_manager: Any | None = None
+    symbols: list[str] = field(default_factory=list)
+    auto_trader: Any | None = None
+
+
+class ReadyStateStore:
+    def __init__(self) -> None:
+        self._ready = False
+
+    async def start(self) -> None:
+        self._ready = True
+
+    async def wait_ready(self, timeout: float | None = None) -> bool:
+        return self._ready
+
+    async def stop(self) -> None:
+        self._ready = False
+
+
+class ReadyNotifier:
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
+class AnalyzerServiceAdapter:
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self._stopped = False
+
+    def start(self, ipc: Any) -> None:
+        self._service.start()
+
+    def is_alive(self) -> bool:
+        workers = getattr(self._service, "_workers", [])
+        return any(worker.is_alive() for worker in workers)
+
+    @property
+    def exitcode(self) -> int | None:
+        workers = getattr(self._service, "_workers", [])
+        exitcodes = [worker.exitcode for worker in workers if worker.exitcode is not None]
+        if not exitcodes:
+            return None if self.is_alive() else 0
+        for exitcode in exitcodes:
+            if exitcode not in (None, 0):
+                return exitcode
+        return 0
+
+    def send_stop(self) -> None:
+        self._service.stop()
+        self._stopped = True
+
+    def join(self, timeout: float) -> None:
+        if self._stopped:
+            return
+        workers = getattr(self._service, "_workers", [])
+        for worker in workers:
+            worker.join(timeout)
+
+    def terminate(self) -> None:
+        workers = getattr(self._service, "_workers", [])
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=1)
+        if not self._stopped:
+            self._service.stop()
+            self._stopped = True
+
+
+class CollectorRuntimeAdapter:
+    def __init__(self, collector: Any, auto_trader: Any | None) -> None:
+        self._collector = collector
+        self._auto_trader = auto_trader
+
+    async def start(self) -> None:
+        await self._collector.start()
+
+    async def stop_accepting(self) -> None:
+        await self._collector.stop_accepting()
+
+    async def stop(self) -> None:
+        await self._collector.stop()
+        if self._auto_trader is None:
+            return
+
+        close = getattr(self._auto_trader, "close", None)
+        if close is None:
+            return
+
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
+    def pending_count(self) -> int:
+        return int(self._collector.pending_count())
 
 
 class MockCollector:
@@ -357,6 +466,15 @@ def _load_auto_trader(enabled: bool) -> Any | None:
         return None
 
 
+def _build_analyzer_service() -> Any:
+    analyzer_module = importlib.import_module("analyzer")
+    analyzer_service = analyzer_module.AnalyzerService(
+        num_workers=int(os.getenv("ANALYZER_WORKERS", "1")),
+        queue_size=int(os.getenv("ANALYZER_QUEUE_SIZE", "1024")),
+    )
+    return AnalyzerServiceAdapter(analyzer_service)
+
+
 def resolve_symbols(raw_symbols: str) -> list[str]:
     default_symbols = ",".join(DEFAULT_TW_SYMBOLS)
     configured = raw_symbols.strip() or default_symbols
@@ -369,14 +487,26 @@ def build_runtime_components(
     ws_host: str,
     ws_port: int,
     use_mock: bool,
-) -> tuple[Any, Any | None, list[str]]:
+) -> RuntimeComponents:
     symbols = resolve_symbols(raw_symbols)
     auto_trader = _load_auto_trader(_env_flag("ENABLE_AUTO_TRADER", "true"))
+    state_store = ReadyStateStore()
+    analyzer = _build_analyzer_service()
+    notifier = ReadyNotifier()
+    ipc_manager = SharedMemoryIPC(size=int(os.getenv("IPC_SHARED_MEMORY_SIZE", "1024")))
 
     if use_mock:
         logger.info("Mode: MOCK")
         collector = MockCollector(symbols, ws_host=ws_host, ws_port=ws_port, auto_trader=auto_trader)
-        return collector, auto_trader, symbols
+        return RuntimeComponents(
+            state_store=state_store,
+            analyzer=analyzer,
+            collector=collector,
+            notifier=notifier,
+            ipc_manager=ipc_manager,
+            symbols=symbols,
+            auto_trader=auto_trader,
+        )
 
     auto_scan = os.getenv("SINOPAC_AUTO_SCAN", "false").lower() == "true"
     if auto_scan:
@@ -399,7 +529,15 @@ def build_runtime_components(
 
     bridge_module = importlib.import_module("sinopac_bridge")
     collector = bridge_module.collector_from_env(symbols, auto_trader=auto_trader)
-    return collector, auto_trader, symbols
+    return RuntimeComponents(
+        state_store=state_store,
+        analyzer=analyzer,
+        collector=collector,
+        notifier=notifier,
+        ipc_manager=ipc_manager,
+        symbols=symbols,
+        auto_trader=auto_trader,
+    )
 
 
 async def main() -> None:
@@ -408,34 +546,28 @@ async def main() -> None:
     ws_port = int(os.getenv("WS_PORT", "8765"))
     use_mock = os.getenv("SINOPAC_MOCK", "false").lower() == "true"
 
-    collector, auto_trader, symbols = build_runtime_components(
+    runtime = build_runtime_components(
         raw_symbols=raw_symbols,
         ws_host=ws_host,
         ws_port=ws_port,
         use_mock=use_mock,
     )
 
-    if auto_trader is not None:
+    if runtime.auto_trader is not None:
         import datetime as _dt
         _today = _dt.datetime.now(tz=_TZ_TW).strftime("%Y%m%d")
-        _restored = await auto_trader.restore_positions(_today)
+        _restored = await runtime.auto_trader.restore_positions(_today)
         if _restored:
             logger.info("Restored %d open position(s) from today's DB snapshot", _restored)
 
-    await collector.start()
-    logger.info("Collector running on ws://%s:%d symbols=%d. Press Ctrl+C to stop.", ws_host, ws_port, len(symbols))
-
-    try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    finally:
-        logger.info("Shutting down...")
-        await collector.stop_accepting()
-        await collector.stop()
-        if auto_trader is not None:
-            await auto_trader.close()
-        logger.info("Stopped.")
+    supervisor = create_supervisor_from_runtime(runtime)
+    logger.info(
+        "Collector running on ws://%s:%d symbols=%d. Press Ctrl+C to stop.",
+        ws_host,
+        ws_port,
+        len(runtime.symbols),
+    )
+    await supervisor.run()
 
 
 if __name__ == "__main__":

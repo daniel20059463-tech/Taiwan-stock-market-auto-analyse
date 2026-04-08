@@ -104,6 +104,61 @@ async def noop_preflight() -> None:
     return None
 
 
+class _CollectorRuntimeAdapter:
+    def __init__(self, collector: Any, auto_trader: Any | None = None) -> None:
+        self._collector = collector
+        self._auto_trader = auto_trader
+
+    async def start(self) -> None:
+        await self._collector.start()
+
+    async def stop_accepting(self) -> None:
+        await self._collector.stop_accepting()
+
+    async def stop(self) -> None:
+        await self._collector.stop()
+        if self._auto_trader is None:
+            return
+
+        close = getattr(self._auto_trader, "close", None)
+        if close is None:
+            return
+
+        result = close()
+        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+            await result
+
+    def pending_count(self) -> int:
+        return int(self._collector.pending_count())
+
+
+def create_supervisor_from_runtime(
+    runtime: Any,
+    *,
+    preflight: Callable[[], Awaitable[None]] | None = None,
+    config: SupervisorConfig | None = None,
+) -> "AppSupervisor":
+    analyzer = runtime.analyzer
+    collector = runtime.collector
+    auto_trader = getattr(runtime, "auto_trader", None)
+    state_store = runtime.state_store
+    notifier = runtime.notifier
+    ipc_manager = getattr(runtime, "ipc_manager", None)
+
+    if auto_trader is not None:
+        collector = _CollectorRuntimeAdapter(collector, auto_trader)
+
+    return AppSupervisor(
+        state_store=state_store,
+        analyzer=analyzer,
+        collector=collector,
+        notifier=notifier,
+        ipc_manager=ipc_manager,
+        preflight=preflight,
+        config=config,
+    )
+
+
 class AppSupervisor:
     def __init__(
         self,

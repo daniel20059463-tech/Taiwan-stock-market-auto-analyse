@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import types
+from dataclasses import is_dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,18 @@ def test_build_runtime_components_continues_without_auto_trader(monkeypatch) -> 
     run = importlib.import_module("run")
     captured: dict[str, object] = {}
 
+    class _FakeAnalyzerService:
+        def __init__(self, **kwargs: object) -> None:
+            self._workers: list[object] = []
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    fake_analyzer = types.SimpleNamespace(AnalyzerService=_FakeAnalyzerService)
+
     def fake_collector_from_env(symbols: list[str], auto_trader=None):
         captured["symbols"] = symbols
         captured["auto_trader"] = auto_trader
@@ -47,6 +60,8 @@ def test_build_runtime_components_continues_without_auto_trader(monkeypatch) -> 
     def fake_import_module(name: str):
         if name == "auto_trader":
             raise ModuleNotFoundError("auto_trader is intentionally unavailable")
+        if name == "analyzer":
+            return fake_analyzer
         if name == "sinopac_bridge":
             return fake_bridge
         raise AssertionError(f"unexpected import: {name}")
@@ -54,16 +69,20 @@ def test_build_runtime_components_continues_without_auto_trader(monkeypatch) -> 
     monkeypatch.setattr(run.importlib, "import_module", fake_import_module)
     monkeypatch.setenv("ENABLE_AUTO_TRADER", "true")
 
-    collector, auto_trader, symbols = run.build_runtime_components(
+    runtime = run.build_runtime_components(
         raw_symbols="2330,2317",
         ws_host="127.0.0.1",
         ws_port=8765,
         use_mock=False,
     )
 
-    assert isinstance(collector, _FakeCollector)
-    assert auto_trader is None
-    assert symbols == ["2330", "2317"]
+    assert is_dataclass(runtime)
+    assert isinstance(runtime.collector, _FakeCollector)
+    assert runtime.auto_trader is None
+    assert runtime.symbols == ["2330", "2317"]
+    assert runtime.state_store is not None
+    assert runtime.notifier is not None
+    assert runtime.analyzer is not None
     assert captured["symbols"] == ["2330", "2317"]
     assert captured["auto_trader"] is None
 

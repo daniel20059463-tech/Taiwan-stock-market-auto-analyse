@@ -4,10 +4,11 @@ import asyncio
 import multiprocessing
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
-from main import AppSupervisor, LifecycleState, SharedMemoryIPC, SupervisorConfig
+from main import AppSupervisor, LifecycleState, SharedMemoryIPC, SupervisorConfig, create_supervisor_from_runtime
 
 
 class FakeStateStore:
@@ -184,6 +185,37 @@ async def test_analyzer_crash_triggers_fail_closed_shutdown() -> None:
         assert "collector.stop_accepting" in events
         assert ipc.cleaned is True
         assert multiprocessing.active_children() == []
+    finally:
+        if supervisor.state is not LifecycleState.STOPPED:
+            await supervisor.shutdown(reason="test_cleanup")
+
+
+@pytest.mark.asyncio
+async def test_create_supervisor_from_runtime_uses_runtime_components() -> None:
+    events: list[str] = []
+    runtime = SimpleNamespace(
+        state_store=FakeStateStore(events),
+        analyzer=FakeAnalyzer(events),
+        collector=FakeCollector(events),
+        notifier=FakeNotifier(events),
+        ipc_manager=SharedMemoryIPC(size=64),
+    )
+
+    supervisor = create_supervisor_from_runtime(
+        runtime,
+        config=SupervisorConfig(
+            sentinel_interval_seconds=0.05,
+            drain_timeout_seconds=0.2,
+            drain_poll_interval_seconds=0.01,
+            analyzer_join_timeout_seconds=0.2,
+        ),
+    )
+
+    try:
+        await supervisor.start()
+        assert supervisor.state is LifecycleState.RUNNING
+        await supervisor.handle_interrupt("SIGINT")
+        assert supervisor.state is LifecycleState.STOPPED
     finally:
         if supervisor.state is not LifecycleState.STOPPED:
             await supervisor.shutdown(reason="test_cleanup")
