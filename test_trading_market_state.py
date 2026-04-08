@@ -54,3 +54,27 @@ def test_calculate_atr_returns_exact_value_from_closed_bars() -> None:
         state.update_tick("2330", price=price, volume=10 + minute, ts_ms=_ts_minute(minute))
 
     assert state.calculate_atr("2330") == 3.5
+
+
+def test_reset_intraday_clears_live_state_but_preserves_history() -> None:
+    state = MarketState()
+
+    prices = [100.0, 102.0, 99.0, 103.0, 98.0, 104.0]
+    for minute, price in enumerate(prices):
+        state.update_tick("2330", price=price, volume=10 + minute, ts_ms=_ts_minute(minute))
+
+    atr_before = state.calculate_atr("2330")
+    avg_volume_before = state.average_volume("2330")
+
+    assert state.open_price("2330") == 100.0
+    assert state.latest_bar("2330") is not None
+    assert atr_before == 3.5
+    assert avg_volume_before == 12.0
+
+    state.reset_intraday()
+
+    assert state.open_price("2330") is None
+    assert state.latest_bar("2330") is None
+    assert state.last_price("2330") == 104.0
+    assert state.calculate_atr("2330") == atr_before
+    assert state.average_volume("2330") == avg_volume_before

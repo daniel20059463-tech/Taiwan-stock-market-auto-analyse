@@ -8,14 +8,12 @@ portfolio summaries through Telegram.
 from __future__ import annotations
 
 import asyncio
-import collections
 import datetime
 import logging
 import math
 import os
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import aiohttp
@@ -26,6 +24,16 @@ from multi_analyst import (
     RiskAnalyst,
     SentimentAnalyst,
     TechnicalAnalyst,
+)
+from trading import (
+    CandleBar,
+    DecisionFactor,
+    DecisionReport,
+    MarketState,
+    PaperPosition,
+    PositionBook,
+    TradeRecord,
+    build_daily_report_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,109 +64,6 @@ MARKET_HALT_PCT = -1.5
 TRAIL_STOP_ATR_MULT = 2.0
 TRAIL_STOP_FALLBACK = 3.0
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
-
-
-@dataclass
-class CandleBar:
-    """Single 1-minute bar aggregated from ticks."""
-
-    ts_min: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: int
-
-
-@dataclass
-class PaperPosition:
-    symbol: str
-    side: str  # "long" | "short"
-    entry_price: float
-    shares: int
-    entry_ts: int
-    entry_change_pct: float
-    stop_price: float
-    target_price: float
-    entry_atr: Optional[float] = None
-    peak_price: float = 0.0
-    trail_stop_price: float = 0.0
-
-
-@dataclass
-class TradeRecord:
-    symbol: str
-    action: str
-    price: float
-    shares: int
-    reason: str
-    pnl: float
-    ts: int
-    stop_price: float = 0.0
-    target_price: float = 0.0
-    gross_pnl: float = 0.0
-    decision_report: "DecisionReport | None" = None
-
-
-@dataclass
-class DecisionFactor:
-    kind: str
-    label: str
-    detail: str
-
-
-@dataclass
-class DecisionReport:
-    report_id: str
-    symbol: str
-    ts: int
-    decision_type: str
-    trigger_type: str
-    confidence: int
-    final_reason: str
-    summary: str
-    supporting_factors: list[DecisionFactor]
-    opposing_factors: list[DecisionFactor]
-    risk_flags: list[str]
-    source_events: list[dict[str, Any]]
-    order_result: dict[str, Any]
-    bull_case: str = ""
-    bear_case: str = ""
-    risk_case: str = ""
-    bull_argument: str = ""
-    bear_argument: str = ""
-    referee_verdict: str = ""
-    debate_winner: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "reportId": self.report_id,
-            "symbol": self.symbol,
-            "ts": self.ts,
-            "decisionType": self.decision_type,
-            "triggerType": self.trigger_type,
-            "confidence": self.confidence,
-            "finalReason": self.final_reason,
-            "summary": self.summary,
-            "supportingFactors": [
-                {"kind": factor.kind, "label": factor.label, "detail": factor.detail}
-                for factor in self.supporting_factors
-            ],
-            "opposingFactors": [
-                {"kind": factor.kind, "label": factor.label, "detail": factor.detail}
-                for factor in self.opposing_factors
-            ],
-            "riskFlags": list(self.risk_flags),
-            "sourceEvents": list(self.source_events),
-            "orderResult": dict(self.order_result),
-            "bullCase": self.bull_case,
-            "bearCase": self.bear_case,
-            "riskCase": self.risk_case,
-            "bullArgument": self.bull_argument,
-            "bearArgument": self.bear_argument,
-            "refereeVerdict": self.referee_verdict,
-            "debateWinner": self.debate_winner,
-        }
 
 
 class AutoTrader:
@@ -201,11 +106,13 @@ class AutoTrader:
         self._disposition = disposition_filter
 
         # Runtime state
-        self._open_prices: dict[str, float] = {}
+        self._market = MarketState()
+        self._book = PositionBook()
+        self._open_prices = self._market.open_prices
         self._prev_close_cache: dict[str, float] = {}
-        self._last_prices: dict[str, float] = {}
-        self._positions: dict[str, PaperPosition] = {}
-        self._trade_history: list[TradeRecord] = []
+        self._last_prices = self._market.last_prices
+        self._positions = self._book.positions
+        self._trade_history = self._book.trade_history
         self._decision_history: list[DecisionReport] = []
         self._last_report_ts: float = time.time()
         
@@ -220,10 +127,10 @@ class AutoTrader:
         self._risk_analyst = RiskAnalyst()
         self._decision_composer = DecisionComposer()
 
-        # Intraday 1-minute bars
-        self._current_bar: dict[str, CandleBar] = {}
-        self._candle_history: dict[str, collections.deque] = {}
-        self._volume_history: dict[str, collections.deque] = {}
+        # Intraday 1-minute bars live in MarketState.
+        self._current_bar = self._market.current_bar
+        self._candle_history = self._market.bar_history
+        self._volume_history = self._market.volume_history
 
         # Trading-day state
         self._current_date: str = ""
@@ -234,8 +141,6 @@ class AutoTrader:
         # Extracted metrics
         self._market_change_pct: float = 0.0
         self._limit_locked: dict[str, str] = {}  # symbol -> 'up' or 'down'
-        from trading.market_state import MarketState
-        self._market = MarketState()
 
     async def on_tick(self, payload: dict[str, Any]) -> None:
         if self._monitor_task is None:
@@ -252,12 +157,9 @@ class AutoTrader:
         self._maybe_reset_day(ts_ms)
 
         # ② 更新 K 棒
-        self._update_candle(symbol, price, volume, ts_ms)
+        self._market.update_tick(symbol, price=price, volume=volume, ts_ms=ts_ms)
 
         # ③ 記錄最新價
-        if symbol not in self._open_prices:
-            self._open_prices[symbol] = price
-        self._last_prices[symbol] = price
         if payload.get("previousClose"):
             self._prev_close_cache[symbol] = float(payload["previousClose"])
 
@@ -281,7 +183,7 @@ class AutoTrader:
             return
 
         # ⑦ 持倉出場檢查（動態停損/停利）
-        position = self._positions.get(symbol)
+        position = self._book.positions.get(symbol)
         if position is not None and position.side == "long":
             await self._check_exit(symbol, price, ts_ms)
         elif position is not None and position.side == "short":
@@ -293,7 +195,7 @@ class AutoTrader:
             elif change_pct >= self._buy_signal_pct:
                 await self._evaluate_buy(symbol, price, change_pct, ts_ms, payload)
             # 評估空方進場（與多方互斥，同一標的只能一個方向）
-            if symbol not in self._positions:
+            if symbol not in self._book.positions:
                 await self._evaluate_short(symbol, price, change_pct, ts_ms, payload)
 
         # ⑧ 定時績效報告
@@ -315,8 +217,7 @@ class AutoTrader:
             if self._eod_closed:
                 self._detect_ex_dividend_adjustments(ts_ms)
             self._current_date = date_str
-            self._open_prices.clear()
-            self._current_bar.clear()
+            self._market.reset_intraday()
             self._limit_locked.clear()
             self._eod_closed = False
             if self._eod_report_task is not None and not self._eod_report_task.done():
@@ -340,7 +241,7 @@ class AutoTrader:
         if self._market_change_pct < -2.0:
             return
 
-        for symbol, pos in list(self._positions.items()):
+        for symbol, pos in list(self._book.positions.items()):
             open_p = self._open_prices.get(symbol)
             prev_p = self._prev_close_cache.get(symbol)
             if not open_p or not prev_p:
@@ -359,76 +260,20 @@ class AutoTrader:
         pos.peak_price = round(pos.peak_price * adj_ratio, 2)
         pos.trail_stop_price = round(pos.trail_stop_price * adj_ratio, 2)
 
-    def _update_candle(self, symbol: str, price: float, volume: int, ts_ms: int) -> None:
-        """Aggregate incoming ticks into 1-minute candles."""
-        ts_min = ts_ms // 60_000
-
-        if symbol not in self._current_bar:
-            self._current_bar[symbol] = CandleBar(
-                ts_min=ts_min,
-                open=price,
-                high=price,
-                low=price,
-                close=price,
-                volume=volume,
-            )
-            return
-
-        bar = self._current_bar[symbol]
-        if ts_min != bar.ts_min:
-            self._candle_history.setdefault(symbol, collections.deque(maxlen=20)).append(bar)
-            self._volume_history.setdefault(symbol, collections.deque(maxlen=10)).append(bar.volume)
-            self._current_bar[symbol] = CandleBar(
-                ts_min=ts_min,
-                open=price,
-                high=price,
-                low=price,
-                close=price,
-                volume=volume,
-            )
-            return
-
-        bar.high = max(bar.high, price)
-        bar.low = min(bar.low, price)
-        bar.close = price
-        bar.volume += volume
-
     def _calc_atr(self, symbol: str) -> Optional[float]:
         """Calculate a simple ATR from recent 1-minute candles."""
-        hist = self._candle_history.get(symbol)
-        if hist is None or len(hist) < ATR_BARS_NEEDED:
-            return None
-
-        bars = list(hist)
-        true_ranges: list[float] = []
-        for index in range(1, len(bars)):
-            prev_close = bars[index - 1].close
-            bar = bars[index]
-            true_ranges.append(
-                max(
-                    bar.high - bar.low,
-                    abs(bar.high - prev_close),
-                    abs(bar.low - prev_close),
-                )
-            )
-
-        if not true_ranges:
-            return None
-
-        return round(sum(true_ranges) / len(true_ranges), 4)
+        return self._market.calculate_atr(symbol)
 
     def _is_volume_confirmed(self, symbol: str) -> bool:
         """Require the active bar volume to beat the recent 5-bar average."""
-        vol_hist = self._volume_history.get(symbol)
-        if vol_hist is None or len(vol_hist) < ATR_BARS_NEEDED:
+        avg_vol = self._market.average_volume(symbol)
+        if avg_vol is None:
             return True
 
-        recent = list(vol_hist)[-5:]
-        avg_vol = sum(recent) / len(recent)
         if avg_vol <= 0:
             return True
 
-        current_bar = self._current_bar.get(symbol)
+        current_bar = self._market.latest_bar(symbol)
         current_vol = current_bar.volume if current_bar else 0
         confirmed = current_vol >= avg_vol * VOLUME_CONFIRM_MULT
         if not confirmed:
@@ -520,7 +365,7 @@ class AutoTrader:
 
     def _build_portfolio_context(self) -> dict[str, Any]:
         """建立投資組合層級的語境，供 AnalystContext 使用。"""
-        closed_trades = [t for t in self._trade_history if t.action in {"SELL", "COVER"}]
+        closed_trades = [t for t in self._book.trade_history if t.action in {"SELL", "COVER"}]
         wins = sum(1 for t in closed_trades if t.pnl > 0)
         win_rate = wins / len(closed_trades) if closed_trades else 0.0
         
@@ -530,7 +375,7 @@ class AutoTrader:
                 if position.side == "short"
                 else (self._last_prices.get(symbol, position.entry_price) - position.entry_price) * position.shares
             )
-            for symbol, position in self._positions.items()
+            for symbol, position in self._book.positions.items()
         )
         
         daily_pnl = self._risk.daily_pnl
@@ -540,7 +385,7 @@ class AutoTrader:
             budget_used = daily_pnl / limit
             
         return {
-            "portfolio_positions_count": len(self._positions),
+            "portfolio_positions_count": len(self._book.positions),
             "portfolio_unrealized_pnl": unrealized_pnl,
             "portfolio_daily_win_rate": win_rate,
             "portfolio_risk_budget_used_pct": budget_used,
@@ -687,7 +532,7 @@ class AutoTrader:
             peak_price=execution_price,
             trail_stop_price=stop_price,
         )
-        self._positions[symbol] = position
+        self._book.positions[symbol] = position
         await self._persist_position_open(symbol)
 
         record = TradeRecord(
@@ -702,7 +547,7 @@ class AutoTrader:
             target_price=target_price,
             decision_report=decision_report,
         )
-        self._trade_history.append(record)
+        self._book.trade_history.append(record)
 
         self._risk.on_buy(symbol, execution_price, shares)
         await self._persist_trade(record)
@@ -739,7 +584,7 @@ class AutoTrader:
         if self._limit_locked.get(symbol) == "down":
             return
             
-        position = self._positions[symbol]
+        position = self._book.positions[symbol]
 
         if price > position.peak_price:
             position.peak_price = price
@@ -776,7 +621,7 @@ class AutoTrader:
         pct_from_entry: float,
         ts_ms: int,
     ) -> None:
-        position = self._positions.pop(symbol)
+        position = self._book.positions.pop(symbol)
         gross_pnl = (price - position.entry_price) * position.shares
         net_pnl = self._risk.calc_net_pnl(position.entry_price, price, position.shares)
         final_reason = {
@@ -838,7 +683,7 @@ class AutoTrader:
             gross_pnl=gross_pnl,
             decision_report=decision_report,
         )
-        self._trade_history.append(record)
+        self._book.trade_history.append(record)
 
         self._risk.on_sell(symbol, net_pnl)
         await self._persist_trade(record)
@@ -1026,7 +871,7 @@ class AutoTrader:
             return
 
         shares = self._shares
-        allowed, reason = self._risk.can_buy(symbol, price, shares, len(self._positions))
+        allowed, reason = self._risk.can_buy(symbol, price, shares, len(self._book.positions))
         if not allowed:
             self._record_skip_decision(
                 symbol=symbol,
@@ -1149,7 +994,7 @@ class AutoTrader:
             peak_price=execution_price,
             trail_stop_price=stop_price,
         )
-        self._positions[symbol] = position
+        self._book.positions[symbol] = position
         await self._persist_position_open(symbol)
 
         record = TradeRecord(
@@ -1164,7 +1009,7 @@ class AutoTrader:
             target_price=target_price,
             decision_report=decision_report,
         )
-        self._trade_history.append(record)
+        self._book.trade_history.append(record)
 
         self._risk.on_buy(symbol, execution_price, shares)
         await self._persist_trade(record)
@@ -1196,7 +1041,7 @@ class AutoTrader:
         if self._limit_locked.get(symbol) == "up":
             return
             
-        position = self._positions[symbol]
+        position = self._book.positions[symbol]
         reason: Optional[str] = None
         if price >= position.stop_price:
             reason = "STOP_LOSS"
@@ -1216,7 +1061,7 @@ class AutoTrader:
         ts_ms: int,
     ) -> None:
         """回補空方部位，計算損益並記錄 COVER 成交。"""
-        position = self._positions.pop(symbol)
+        position = self._book.positions.pop(symbol)
         await self._persist_position_close(symbol)
         
         # 模擬回補滑價（買得更貴）
@@ -1284,7 +1129,7 @@ class AutoTrader:
             gross_pnl=gross_pnl,
             decision_report=decision_report,
         )
-        self._trade_history.append(record)
+        self._book.trade_history.append(record)
 
         self._risk.on_sell(symbol, net_pnl)
         await self._persist_trade(record)
@@ -1313,13 +1158,13 @@ class AutoTrader:
 
     async def _close_all_eod(self, ts_ms: int) -> None:
         """Force-close all positions after 13:25."""
-        symbols = list(self._positions.keys())
+        symbols = list(self._book.positions.keys())
         if not symbols:
             return
 
         logger.info("AutoTrader: EOD close triggered for %d open positions", len(symbols))
         for symbol in symbols:
-            position = self._positions[symbol]
+            position = self._book.positions[symbol]
             if position.side == "long" and self._limit_locked.get(symbol) == "down":
                 await self._send(f"⚠️ [警告] {symbol} 跌停鎖死，EOD 模擬平倉可能失真！")
             elif position.side == "short" and self._limit_locked.get(symbol) == "up":
@@ -1385,7 +1230,7 @@ class AutoTrader:
                         peak_price=row.get("peak_price", row["entry_price"]),
                         trail_stop_price=row.get("trail_stop_price", row["stop_price"]),
                     )
-                    self._positions[row["symbol"]] = position
+                    self._book.positions[row["symbol"]] = position
                     
                 logger.info("AutoTrader restored %d positions for date %s", len(rows), trade_date)
                 return len(rows)
@@ -1399,7 +1244,7 @@ class AutoTrader:
             return
         try:
             from models import get_session, upsert_paper_position
-            position = self._positions.get(symbol)
+            position = self._book.positions.get(symbol)
             if not position:
                 return
             async with get_session() as session:
@@ -1433,68 +1278,23 @@ class AutoTrader:
             logger.warning("Failed to persist closed position %s: %s", symbol, exc)
 
     def get_portfolio_snapshot(self) -> dict[str, Any]:
-        sells = [trade for trade in self._trade_history if trade.action in {"SELL", "COVER"}]
+        snapshot = self._book.build_snapshot(self._last_prices, session_id=self._session_id)
+        recent_decisions = [report.to_dict() for report in self._decision_history[-40:]]
+
+        sells = [trade for trade in self._book.trade_history if trade.action in {"SELL", "COVER"}]
         realized_pnl = sum(trade.pnl for trade in sells)
+        unrealized_pnl = self._book.unrealized_pnl(self._last_prices)
         wins = sum(1 for trade in sells if trade.pnl > 0)
         win_rate = wins / len(sells) * 100 if sells else 0.0
 
-        positions = []
-        unrealized_total = 0.0
-        for symbol, position in self._positions.items():
-            last = self._last_prices.get(symbol, position.entry_price)
-            if position.side == "short":
-                pnl = (position.entry_price - last) * position.shares
-                pct = (position.entry_price - last) / position.entry_price * 100
-            else:
-                pnl = (last - position.entry_price) * position.shares
-                pct = (last - position.entry_price) / position.entry_price * 100
-            unrealized_total += pnl
-            positions.append(
-                {
-                    "symbol": symbol,
-                    "side": position.side,
-                    "entryPrice": position.entry_price,
-                    "currentPrice": last,
-                    "shares": position.shares,
-                    "pnl": round(pnl, 0),
-                    "pct": round(pct, 2),
-                    "entryTs": position.entry_ts,
-                    "stopPrice": position.stop_price,
-                    "targetPrice": position.target_price,
-                    "trailStopPrice": position.trail_stop_price,
-                }
-            )
-
-        recent_trades = [
-            {
-                "symbol": trade.symbol,
-                "action": trade.action,
-                "price": trade.price,
-                "shares": trade.shares,
-                "reason": trade.reason,
-                "netPnl": round(trade.pnl, 0),
-                "grossPnl": round(trade.gross_pnl, 0),
-                "ts": trade.ts,
-                "decisionReport": trade.decision_report.to_dict() if trade.decision_report is not None else None,
-            }
-            for trade in self._trade_history[-20:]
-        ]
-        recent_decisions = [report.to_dict() for report in self._decision_history[-40:]]
-
-        return {
-            "type": "PAPER_PORTFOLIO",
-            "positions": positions,
-            "recentTrades": recent_trades,
-            "recentDecisions": recent_decisions,
-            "realizedPnl": round(realized_pnl, 0),
-            "unrealizedPnl": round(unrealized_total, 0),
-            "totalPnl": round(realized_pnl + unrealized_total, 0),
-            "tradeCount": len(sells),
-            "winRate": round(win_rate, 1),
-            "marketChangePct": round(self._market_change_pct, 2),
-            "riskStatus": self._risk.status_dict(),
-            "sessionId": self._session_id,
-        }
+        snapshot["recentDecisions"] = recent_decisions
+        snapshot["realizedPnl"] = round(realized_pnl, 0)
+        snapshot["totalPnl"] = round(realized_pnl + unrealized_pnl, 0)
+        snapshot["tradeCount"] = len(sells)
+        snapshot["winRate"] = round(win_rate, 1)
+        snapshot["marketChangePct"] = round(self._market_change_pct, 2)
+        snapshot["riskStatus"] = self._risk.status_dict()
+        return snapshot
 
     def _schedule_eod_report(self, ts_ms: int) -> None:
         if self._daily_reporter is None:
@@ -1523,46 +1323,13 @@ class AutoTrader:
             logger.warning("Daily EOD report failed: %s", exc)
 
     def _build_daily_report_payload(self, ts_ms: int) -> dict[str, Any]:
-        report_date = _ts_to_date(ts_ms)
-        trades = [
-            trade for trade in self._trade_history
-            if _ts_to_date(trade.ts) == report_date
-        ]
-        closed_trades = [trade for trade in trades if trade.action in {"SELL", "COVER"}]
-        realized_pnl = sum(trade.pnl for trade in closed_trades)
-        wins = sum(1 for trade in closed_trades if trade.pnl > 0)
-        win_rate = wins / len(closed_trades) * 100 if closed_trades else 0.0
-        unrealized_pnl = sum(
-            (
-                (position.entry_price - self._last_prices.get(symbol, position.entry_price)) * position.shares
-                if position.side == "short"
-                else (self._last_prices.get(symbol, position.entry_price) - position.entry_price) * position.shares
-            )
-            for symbol, position in self._positions.items()
+        return build_daily_report_payload(
+            ts_ms,
+            self._book.trade_history,
+            self._book.positions,
+            self._last_prices,
+            self._risk,
         )
-        return {
-            "date": report_date,
-            "tradeCount": len(closed_trades),
-            "winRate": round(win_rate, 1),
-            "realizedPnl": round(realized_pnl, 0),
-            "unrealizedPnl": round(unrealized_pnl, 0),
-            "totalPnl": round(realized_pnl + unrealized_pnl, 0),
-            "riskStatus": self._risk.status_dict(),
-            "trades": [
-                {
-                    "symbol": trade.symbol,
-                    "action": trade.action,
-                    "price": round(trade.price, 2),
-                    "shares": trade.shares,
-                    "reason": trade.reason,
-                    "netPnl": round(trade.pnl, 2),
-                    "grossPnl": round(trade.gross_pnl, 2),
-                    "ts": trade.ts,
-                    "decisionReport": trade.decision_report.to_dict() if trade.decision_report is not None else None,
-                }
-                for trade in trades
-            ],
-        }
 
     async def _evaluate_buy(
         self,
@@ -1717,7 +1484,7 @@ class AutoTrader:
         lots = 2 if confidence >= 80 else 1
         shares = lots * SHARES_PER_LOT
 
-        allowed, reason = self._risk.can_buy(symbol, price, shares, len(self._positions))
+        allowed, reason = self._risk.can_buy(symbol, price, shares, len(self._book.positions))
         if not allowed:
             logger.info("%s buy rejected by risk manager: %s", symbol, reason)
             self._record_skip_decision(
@@ -1829,7 +1596,7 @@ class AutoTrader:
         pct_from_entry: float,
         ts_ms: int,
     ) -> None:
-        position = self._positions.pop(symbol)
+        position = self._book.positions.pop(symbol)
         await self._persist_position_close(symbol)
         
         # 模擬賣出滑價（賣得更便宜）
@@ -1925,7 +1692,7 @@ class AutoTrader:
             gross_pnl=gross_pnl,
             decision_report=decision_report,
         )
-        self._trade_history.append(record)
+        self._book.trade_history.append(record)
 
         self._risk.on_sell(symbol, net_pnl)
         await self._persist_trade(record)
@@ -1960,13 +1727,13 @@ class AutoTrader:
             await self._send(f"[風控警示] 當日損益已達限制：{daily_pnl:+,.0f} 元，系統將暫停新單。")
 
     async def _send_performance_report(self) -> None:
-        sells = [trade for trade in self._trade_history if trade.action in {"SELL", "COVER"}]
+        sells = [trade for trade in self._book.trade_history if trade.action in {"SELL", "COVER"}]
         realized_pnl = sum(trade.pnl for trade in sells)
         wins = sum(1 for trade in sells if trade.pnl > 0)
         win_rate = wins / len(sells) * 100 if sells else 0.0
         unrealized = sum(
             (self._last_prices.get(symbol, position.entry_price) - position.entry_price) * position.shares
-            for symbol, position in self._positions.items()
+            for symbol, position in self._book.positions.items()
         )
         total = realized_pnl + unrealized
         risk = self._risk.status_dict()
@@ -1989,7 +1756,7 @@ class AutoTrader:
         text = "\n".join(
             [
                 "[模擬交易] 績效摘要",
-                f"持倉：{len(self._positions)} / {risk['maxPositions']} 檔",
+                f"持倉：{len(self._book.positions)} / {risk['maxPositions']} 檔",
                 f"已完成交易：{len(sells)} 筆，勝率 {wins}/{len(sells) or 1} = {win_rate:.1f}%",
                 f"已實現損益：{sign(realized_pnl)}{realized_pnl:,.0f} 元",
                 f"未實現損益：{sign(unrealized)}{unrealized:,.0f} 元",

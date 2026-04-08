@@ -26,6 +26,22 @@ class MarketState:
         self._bar_history: dict[str, collections.deque[CandleBar]] = {}
         self._volume_history: dict[str, collections.deque[int]] = {}
 
+    @property
+    def open_prices(self) -> dict[str, float]:
+        return self._open_prices
+
+    @property
+    def current_bar(self) -> dict[str, CandleBar]:
+        return self._current_bar
+
+    @property
+    def bar_history(self) -> dict[str, collections.deque[CandleBar]]:
+        return self._bar_history
+
+    @property
+    def volume_history(self) -> dict[str, collections.deque[int]]:
+        return self._volume_history
+
     def update_tick(self, symbol: str, *, price: float, volume: int, ts_ms: int) -> None:
         ts_min = ts_ms // 60_000
 

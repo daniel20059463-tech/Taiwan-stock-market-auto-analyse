@@ -39,6 +39,16 @@ class PositionBook:
     positions: dict[str, PaperPosition] = field(default_factory=dict)
     trade_history: list[TradeRecord] = field(default_factory=list)
 
+    def unrealized_pnl(self, last_prices: Mapping[str, float]) -> float:
+        total = 0.0
+        for symbol, position in self.positions.items():
+            last_price = float(last_prices.get(symbol, position.entry_price))
+            if position.side == "short":
+                total += (position.entry_price - last_price) * position.shares
+            else:
+                total += (last_price - position.entry_price) * position.shares
+        return total
+
     def build_snapshot(
         self,
         last_prices: Mapping[str, float],
@@ -76,10 +86,7 @@ class PositionBook:
                     "entryTs": position.entry_ts,
                     "stopPrice": position.stop_price,
                     "targetPrice": position.target_price,
-                    "peakPrice": position.peak_price,
                     "trailStopPrice": position.trail_stop_price,
-                    "entryChangePct": position.entry_change_pct,
-                    "entryAtr": position.entry_atr,
                     "pnl": round(pnl, 0),
                     "pct": round(pct, 2),
                 }
