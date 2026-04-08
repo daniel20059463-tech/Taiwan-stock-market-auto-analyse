@@ -18,7 +18,7 @@
       "endpoints": [
         "https://github.com/daniel20059463-tech/Taiwan-stock-market-auto-analyse/releases/latest/download/latest.json"
       ],
-      "pubkey": "__TAURI_UPDATER_PUBLIC_KEY__"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxMURDNzMzNjFDMjQzNEIKUldSTFE4SmhNOGNkSVNsb1JHRVB4UXVNTW9aK29ydFMrbmhPM1IraHpWd3phYnhTMjlSVEc1SjgK"
     }
   },
   "app": {
@@ -47,5 +47,3 @@
     ]
   }
 }
-
-

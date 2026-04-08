@@ -701,15 +701,13 @@ export function Dashboard({ symbols, instruments = [], title = "台股模擬交�
                   cursor: "pointer",
                 }}
               >
-                {sectorGroups.map((group) => (
-                  <optgroup key={group.label} label={group.label}>
-                    {group.options.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
+                {sectorGroups.flatMap((group) =>
+                  group.options.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))
+                )}
               </select>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "10px" }}>
                 {metricCard("連線", connectionState === "open" ? "已連線" : connectionState === "reconnecting" ? "重連中" : connectionState === "connecting" ? "連線中" : "待命", connectionState === "open" ? palette.success : palette.warning)}
