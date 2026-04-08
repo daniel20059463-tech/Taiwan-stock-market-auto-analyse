@@ -116,17 +116,26 @@ class _CollectorRuntimeAdapter:
         await self._collector.stop_accepting()
 
     async def stop(self) -> None:
-        await self._collector.stop()
-        if self._auto_trader is None:
-            return
+        collector_error: Exception | None = None
+        try:
+            await self._collector.stop()
+        except Exception as exc:
+            collector_error = exc
 
-        close = getattr(self._auto_trader, "close", None)
-        if close is None:
-            return
+        try:
+            if self._auto_trader is None:
+                return
 
-        result = close()
-        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-            await result
+            close = getattr(self._auto_trader, "close", None)
+            if close is None:
+                return
+
+            result = close()
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                await result
+        finally:
+            if collector_error is not None:
+                raise collector_error
 
     def pending_count(self) -> int:
         return int(self._collector.pending_count())

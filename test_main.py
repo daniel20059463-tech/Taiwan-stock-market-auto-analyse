@@ -63,6 +63,20 @@ class FakeNotifier:
         self.events.append("notifier.stop")
 
 
+class FailingStopCollector(FakeCollector):
+    async def stop(self) -> None:
+        await super().stop()
+        raise RuntimeError("collector stop failed")
+
+
+class FakeAutoTrader:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def close(self) -> None:
+        self.events.append("auto_trader.close")
+
+
 def analyzer_worker(stop_event: multiprocessing.synchronize.Event) -> None:
     while not stop_event.is_set():
         time.sleep(0.05)
@@ -216,6 +230,41 @@ async def test_create_supervisor_from_runtime_uses_runtime_components() -> None:
         assert supervisor.state is LifecycleState.RUNNING
         await supervisor.handle_interrupt("SIGINT")
         assert supervisor.state is LifecycleState.STOPPED
+    finally:
+        if supervisor.state is not LifecycleState.STOPPED:
+            await supervisor.shutdown(reason="test_cleanup")
+
+
+@pytest.mark.asyncio
+async def test_runtime_supervisor_closes_auto_trader_even_if_collector_stop_fails() -> None:
+    events: list[str] = []
+    runtime = SimpleNamespace(
+        state_store=FakeStateStore(events),
+        analyzer=FakeAnalyzer(events),
+        collector=FailingStopCollector(events),
+        notifier=FakeNotifier(events),
+        ipc_manager=SharedMemoryIPC(size=64),
+        auto_trader=FakeAutoTrader(events),
+    )
+
+    supervisor = create_supervisor_from_runtime(
+        runtime,
+        config=SupervisorConfig(
+            sentinel_interval_seconds=0.05,
+            drain_timeout_seconds=0.2,
+            drain_poll_interval_seconds=0.01,
+            analyzer_join_timeout_seconds=0.2,
+        ),
+    )
+
+    try:
+        await supervisor.start()
+        await supervisor.handle_interrupt("SIGINT")
+
+        assert supervisor.state is LifecycleState.STOPPED
+        assert "collector.stop" in events
+        assert "auto_trader.close" in events
+        assert events.index("collector.stop") < events.index("auto_trader.close")
     finally:
         if supervisor.state is not LifecycleState.STOPPED:
             await supervisor.shutdown(reason="test_cleanup")
