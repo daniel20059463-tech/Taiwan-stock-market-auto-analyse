@@ -21,3 +21,7 @@ src-tauri/target/
 src-tauri/backend/*.exe
 src-tauri/backend/*.pyd
 src-tauri/backend/*.dll
+.tauri-signing-key
+.tauri-signing-key.pub
+build/
+latest.json

@@ -1,28 +1,52 @@
 🇹🇼 台股模擬交易系統 - AI 開發架構與安全規範 (AGENT.md)
+
 1. 系統核心與架構解耦 (Architecture Decoupling)
 本系統嚴禁採用「單一腳本包山包海」的寫法。為避免 CPU 密集運算阻塞 I/O，系統必須拆分為以下獨立模組，並透過 Message Queue（如 Redis/Celery）進行溝通：
-Collector (I/O 層)：專責非同步抓取行情與新聞。
-Analyzer Worker (CPU 層)：專責 NLP 輿情分析與模型推論，獨立於主執行緒之外。
-Signal Engine (決策層)：接收乾淨數據產生訊號，不直接碰觸外部 API。
-Notifier (通知層)：專責發送結果至 Telegram。
+  Collector (I/O 層)：專責非同步抓取行情與新聞。
+  Analyzer Worker (CPU 層)：專責 NLP 輿情分析與模型推論，獨立於主執行緒之外。
+  Signal Engine (決策層)：接收乾淨數據產生訊號，不直接碰觸外部 API。包含多重分析師辯論機制（NewsAnalyst / SentimentAnalyst / TechnicalAnalyst / RiskAnalyst → BullResearcher / BearResearcher → DebateReferee）。
+  Notifier (通知層)：專責發送結果至 Telegram，配備 Token Bucket 限流與降級合併機制。
+
 2. 效能與併發防護邊界 (Performance Guardrails)
-嚴格的非同步原則：所有網路請求與 Telegram 廣播，必須全面使用 asyncio、aiohttp 或 websockets。
-禁止阻塞事件迴圈：絕對不可在 asyncio 迴圈內直接執行 Pandas、NLP 分析等 CPU-bound 工作，必須交由 ProcessPoolExecutor 或獨立的 Worker 處理，否則將導致假即時與延遲。
-快取與速率限制 (Rate Limit)：外部資料源與 Telegram API 皆須實作本地快取與 Token Bucket 限流機制，同一訊號區間內去重後才發送，避免觸發 API 封鎖。
+  嚴格的非同步原則：所有網路請求與 Telegram 廣播，必須全面使用 asyncio、aiohttp 或 websockets。
+  禁止阻塞事件迴圈：絕對不可在 asyncio 迴圈內直接執行 Pandas、NLP 分析等 CPU-bound 工作，必須交由 ProcessPoolExecutor 或獨立的 Worker 處理，否則將導致假即時與延遲。
+  快取與速率限制 (Rate Limit)：外部資料源與 Telegram API 皆須實作本地快取與 Token Bucket 限流機制，同一訊號區間內去重後才發送，避免觸發 API 封鎖。
+  DB 寫入節流 (Debounce)：高頻更新（如追蹤停損隨 tick 調整）須設定最小寫入間隔（預設 30 秒），避免 DB 寫入風暴。平倉與關機時自動 flush 所有待寫入狀態。
+
 3. 交易安全與資料庫鎖定 (Transaction Security)
-防範競態條件 (Race Condition)：禁止使用 SQLite 或單純的 Python dict 記錄帳戶狀態。必須採用 PostgreSQL，且在處理任何餘額扣款或部位變更時，強制使用悲觀鎖 (Row-level Lock，如 SELECT ... FOR UPDATE)。
-指令冪等性 (Idempotency)：每一筆交易與訊號必須帶有唯一 UUID 與時間戳記，防止網路重試造成重複下單。
+  防範競態條件 (Race Condition)：禁止使用 SQLite 或單純的 Python dict 記錄帳戶狀態。必須採用 PostgreSQL，且在處理任何餘額扣款或部位變更時，強制使用悲觀鎖 (Row-level Lock，如 SELECT ... FOR UPDATE)。
+  指令冪等性 (Idempotency)：每一筆交易與訊號必須帶有唯一 UUID 與時間戳記，防止網路重試造成重複下單。
+
 4. 資安邊界與 Telegram 降級原則 (Security & Permissions)
-Telegram 降級為「申請入口」：Telegram 僅作為通知顯示器，絕非系統控制台。Bot 不得直接執行敏感的交易或系統操作，高風險指令（如清除快取、切換資料源）必須有白名單與雙重驗證 (Challenge Token)。
-機密集中管理 (Secrets Management)：所有 API Key、Bot Token 與資料庫帳密，絕對不可明碼寫入程式碼或 Log 中。必須透過集中式的環境變數 (如 .env) 或 Secret Manager 存取。
-Webhook 驗證：若使用 Telegram Webhook，必須在 API Gateway 或 Nginx 層強制檢驗 X-Telegram-Bot-Api-Secret-Token。
-5. AI Agent 工作與自我修正迴圈 (Feedback Loop)
-身為協助開發的 AI Agent，你必須在一個可持續自我驗證的迴圈內工作
-：
-產出程式碼後，必須自行撰寫並執行測試 (Test)
-。
-若遇到錯誤或 Linter 警告（包含安全規則違反），請自行讀取 Error Log (Read Logs)
-。
-重現問題並自我修正 (Reproduce & Fix)
-。
-若重複失敗達 3 次，或涉及架構邊界變更，請暫停並向人類開發者回報。
+  Telegram 降級為「申請入口」：Telegram 僅作為通知顯示器，絕非系統控制台。Bot 不得直接執行敏感的交易或系統操作，高風險指令（如清除快取、切換資料源）必須有白名單與雙重驗證 (Challenge Token)。
+  機密集中管理 (Secrets Management)：所有 API Key、Bot Token 與資料庫帳密，絕對不可明碼寫入程式碼或 Log 中。必須透過集中式的環境變數 (如 .env) 或 Secret Manager 存取。
+  Webhook 驗證：若使用 Telegram Webhook，必須在 API Gateway 或 Nginx 層強制檢驗 X-Telegram-Bot-Api-Secret-Token。
+
+5. 持倉狀態持久化與恢復 (State Persistence & Recovery)
+  活躍持倉快照 (PaperPositionSnapshot)：每次開倉時 UPSERT 寫入 DB，平倉時 DELETE。快照包含完整即時狀態（peak_price、trail_stop_price、entry_atr 等）。
+  啟動恢復 (Restore on Start)：進程啟動時透過 restore_positions(trade_date) 從 DB 讀取同日持倉，注入 PositionBook，確保重啟不遺失未平倉部位。
+  寫入節流 (Debounce)：trail_stop 隨 tick 調整時，DB 寫入設有 30 秒最小間隔。EOD 平倉前與系統關機時，自動 flush 所有待寫入的 dirty positions。
+
+6. 策略進化迴路 (Strategy Evolution Loop)
+  自動績效分析 (StrategyTuner)：每日 EOD 後從 DB 讀取近 30 日已平倉交易，按訊號強度與出場原因分組，計算各組勝率與期望值 (EV)。
+  參數自動調整：根據分析結果自動調整 BUY_SIGNAL_PCT、SHORT_SIGNAL_PCT、TRAIL_STOP_ATR_MULT 等核心參數，每次最多 ±20%，至少 10 筆成交才觸發。
+  變更可追溯 (StrategyParamLog)：所有參數調整記錄寫入 DB，包含前後值、原因、依據筆數，供事後審計與回溯分析。
+  參數讀取：策略參數從 strategy_params.json 讀取，系統啟動時若檔案不存在則使用預設值。
+
+7. 組合情境工程 (Portfolio Context Engineering)
+  分析師決策時注入組合全局狀態（持倉數量、未實現損益、當日勝率、風控預算消耗百分比）。
+  技術分析師：組合浮虧超過閾值時降低進場信心。
+  風控分析師：持倉接近上限時減分、風控預算消耗超過 80% 時強制阻擋新倉。
+
+8. AI Agent 工作與自我修正迴圈 (Feedback Loop)
+  身為協助開發的 AI Agent，你必須在一個可持續自我驗證的迴圈內工作：
+  產出程式碼後，必須自行撰寫並執行測試 (Test)。
+  若遇到錯誤或 Linter 警告（包含安全規則違反），請自行讀取 Error Log (Read Logs)。
+  重現問題並自我修正 (Reproduce & Fix)。
+  若重複失敗達 3 次，或涉及架構邊界變更，請暫停並向人類開發者回報。
+
+9. 台股特定業務邏輯與過濾 (Taiwan Market Specifics)
+台股有獨特的交易限制，若 AI 忽略這些，模擬交易的數據會失真：
+  漲跌停狀態處理：Analyzer 與 Signal Engine 必須檢查委託標的是否處於「漲停鎖死 (Limit Up)」或「跌停鎖死 (Limit Down)」狀態。禁止在鎖死狀態下計算成交，避免虛假的績效。
+  處置股與全額交割預警：系統需識別處置股 (Stock under disposition)，調整其風控權重或限制進場。
+  除權息自動校準：針對跨日持倉，必須有處理除權息造成價格跳空的邏輯（還原股價），否則會觸發錯誤的移動停損。
