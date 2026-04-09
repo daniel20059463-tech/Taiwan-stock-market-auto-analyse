@@ -154,6 +154,11 @@ function New-LatestJson {
     Set-Content -LiteralPath $OutputPath -Value $json -Encoding utf8
 }
 
+function Get-GitHubAssetName {
+    param([string]$FileName)
+    return $FileName -replace ' ', '.'
+}
+
 function Write-Utf8NoBomFile {
     param(
         [string]$Path,
@@ -185,6 +190,8 @@ Set-Location $projectRoot
 
 $releaseCreated = $false
 $releasePublished = $false
+$remoteTagCreated = $false
+$localTagCreated = $false
 $restoreConfig = $null
 $tempDir = $null
 $tag = $null
@@ -255,6 +262,12 @@ try {
         Fail-Step "Tag $tag already exists on GitHub."
     }
 
+    $localTagExists = [string]::Join("", @(& git tag --list $tag))
+    $localTagExists = $localTagExists.Trim()
+    if ($localTagExists) {
+        Fail-Step "Local tag $tag already exists."
+    }
+
     Write-Step "Injecting updater configuration for release build"
 
     $restoreConfig = Get-Content -LiteralPath $tauriConfigPath -Raw
@@ -298,7 +311,8 @@ try {
     $latestJsonPath = Join-Path $tempDir "latest.json"
     $releaseNotesPath = Join-Path $tempDir "release-notes.md"
 
-    $encodedUpdaterName = [System.Uri]::EscapeDataString($updaterArtifact.Name)
+    $githubUpdaterAssetName = Get-GitHubAssetName -FileName $updaterArtifact.Name
+    $encodedUpdaterName = [System.Uri]::EscapeDataString($githubUpdaterAssetName)
     $releaseAssetUrl = "https://github.com/$Repo/releases/download/$tag/$encodedUpdaterName"
     $signature = (Get-Content -LiteralPath $updaterSig.FullName -Raw).Trim()
 
@@ -333,11 +347,16 @@ try {
         return
     }
 
+    Write-Step "Creating and pushing release tag"
+    Invoke-CheckedCommand -FilePath "git" -Arguments @("tag", $tag, $TargetRef) -FailureMessage "Creating local release tag failed"
+    $localTagCreated = $true
+    Invoke-CheckedCommand -FilePath "git" -Arguments @("push", "origin", "refs/tags/$tag") -FailureMessage "Pushing release tag failed"
+    $remoteTagCreated = $true
+
     Write-Step "Creating draft GitHub release"
     Invoke-CheckedCommand -FilePath $ghPath -Arguments @(
         "release", "create", $tag,
         "--repo", $Repo,
-        "--target", $TargetRef,
         "--draft",
         "--title", $tag,
         "--notes-file", $releaseNotesPath
@@ -345,15 +364,16 @@ try {
     $releaseCreated = $true
 
     Write-Step "Uploading release assets"
-    Invoke-CheckedCommand -FilePath $ghPath -Arguments @(
-        "release", "upload", $tag,
+    $assetPaths = @(
         $installerExe.FullName,
         $installerMsi.FullName,
         $updaterArtifact.FullName,
         $updaterSig.FullName,
-        $latestJsonPath,
-        "--repo", $Repo
-    ) -FailureMessage "Uploading release assets failed"
+        $latestJsonPath
+    ) | Select-Object -Unique
+
+    $uploadArguments = @("release", "upload", $tag) + $assetPaths + @("--repo", $Repo)
+    Invoke-CheckedCommand -FilePath $ghPath -Arguments $uploadArguments -FailureMessage "Uploading release assets failed"
 
     Write-Step "Verifying draft release assets"
     $releaseView = & $ghPath release view $tag --repo $Repo --json isDraft,assets,url
@@ -364,12 +384,12 @@ try {
     $releaseJson = $releaseView | ConvertFrom-Json
     $uploadedNames = @($releaseJson.assets | ForEach-Object { $_.name })
     $expectedNames = @(
-        $installerExe.Name,
-        $installerMsi.Name,
-        $updaterArtifact.Name,
-        $updaterSig.Name,
+        (Get-GitHubAssetName -FileName $installerExe.Name),
+        (Get-GitHubAssetName -FileName $installerMsi.Name),
+        (Get-GitHubAssetName -FileName $updaterArtifact.Name),
+        (Get-GitHubAssetName -FileName $updaterSig.Name),
         "latest.json"
-    )
+    ) | Select-Object -Unique
 
     foreach ($expectedName in $expectedNames) {
         if ($uploadedNames -notcontains $expectedName) {
@@ -394,6 +414,13 @@ catch {
     if ($releaseCreated -and -not $releasePublished -and $tag) {
         Write-Warning "Release flow failed after draft creation. Cleaning up draft release and tag $tag."
         & $ghPath release delete $tag --repo $Repo --cleanup-tag --yes *> $null
+    } elseif ($remoteTagCreated -and $tag) {
+        Write-Warning "Release flow failed after tag creation. Cleaning up tag $tag."
+        & git push origin ":refs/tags/$tag" *> $null
+    }
+
+    if ($localTagCreated -and $tag) {
+        & git tag -d $tag *> $null
     }
 
     throw $errorMessage
