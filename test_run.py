@@ -207,3 +207,69 @@ def test_desktop_backend_uses_project_root_env_when_frozen(monkeypatch, tmp_path
     assert calls[0] == ("chdir", project_root)
     assert calls[1] == ("load_dotenv", project_root / ".env")
     assert calls[2] == ("run.main", None)
+
+
+def test_desktop_backend_prefers_current_working_directory_when_frozen(monkeypatch, tmp_path) -> None:
+    desktop_backend = importlib.import_module("desktop_backend")
+    calls: list[tuple[str, object]] = []
+
+    fake_run_module = types.SimpleNamespace()
+
+    async def fake_run_main() -> None:
+        calls.append(("run.main", None))
+
+    fake_run_module.main = fake_run_main
+
+    install_root = tmp_path / "installed-app"
+    install_root.mkdir(parents=True)
+    project_root = tmp_path / "workspace"
+    project_root.mkdir(parents=True)
+    (project_root / "run.py").write_text("async def main():\n    return None\n", encoding="utf-8")
+    (project_root / ".env").write_text("FOO=bar\n", encoding="utf-8")
+
+    monkeypatch.setattr(desktop_backend.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        desktop_backend.sys,
+        "executable",
+        str(install_root / "desktop_backend.exe"),
+    )
+    monkeypatch.setattr(desktop_backend.os, "getcwd", lambda: str(project_root))
+    monkeypatch.setattr(desktop_backend.os, "chdir", lambda path: calls.append(("chdir", path)))
+    monkeypatch.setattr(
+        desktop_backend,
+        "load_dotenv",
+        lambda path=None, *args, **kwargs: calls.append(("load_dotenv", path)),
+    )
+    monkeypatch.setattr(
+        desktop_backend.importlib,
+        "import_module",
+        lambda name: fake_run_module if name == "run" else importlib.import_module(name),
+    )
+
+    result = desktop_backend.main()
+
+    assert result == 0
+    assert calls[0] == ("chdir", project_root)
+    assert calls[1] == ("load_dotenv", project_root / ".env")
+    assert calls[2] == ("run.main", None)
+
+
+def test_desktop_backend_entrypoint_calls_freeze_support_before_main(monkeypatch) -> None:
+    desktop_backend = importlib.import_module("desktop_backend")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        desktop_backend.multiprocessing,
+        "freeze_support",
+        lambda: calls.append("freeze_support"),
+    )
+    monkeypatch.setattr(
+        desktop_backend,
+        "main",
+        lambda: calls.append("main") or 0,
+    )
+
+    result = desktop_backend.entrypoint()
+
+    assert result == 0
+    assert calls == ["freeze_support", "main"]

@@ -220,10 +220,7 @@ fn resolve_launch_target(app: &AppHandle) -> Result<BackendLaunchTarget, String>
     }
 
     let candidate = resolve_packaged_backend_path(app)?;
-    let working_dir = candidate
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| format!("Packaged backend path has no parent: {}", candidate.display()))?;
+    let working_dir = resolve_packaged_working_dir(&candidate)?;
 
     if candidate.is_file() {
         return Ok(BackendLaunchTarget::PackagedBinary {
@@ -245,16 +242,21 @@ fn resolve_project_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn resolve_packaged_backend_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let relative_path = PathBuf::from(format!(
-        "{}-{}.{}",
-        BACKEND_BUNDLE_STEM,
-        backend_target_triple(),
-        platform_backend_extension()
-    ));
+fn resolve_packaged_working_dir(candidate: &Path) -> Result<PathBuf, String> {
+    let project_root = resolve_project_root();
+    if project_root.join("run.py").is_file() {
+        return Ok(project_root);
+    }
 
+    candidate
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("Packaged backend path has no parent: {}", candidate.display()))
+}
+
+fn resolve_packaged_backend_path(app: &AppHandle) -> Result<PathBuf, String> {
     if let Ok(resource_dir) = app.path().resource_dir() {
-        return Ok(resource_dir.join(&relative_path));
+        return Ok(resolve_packaged_backend_path_from_dir(&resource_dir));
     }
 
     let current_binary =
@@ -263,7 +265,57 @@ fn resolve_packaged_backend_path(app: &AppHandle) -> Result<PathBuf, String> {
         .parent()
         .ok_or_else(|| format!("App binary has no parent directory: {}", current_binary.display()))?;
 
-    Ok(executable_dir.join(relative_path))
+    Ok(resolve_packaged_backend_path_from_dir(executable_dir))
+}
+
+fn resolve_packaged_backend_path_from_dir(base_dir: &Path) -> PathBuf {
+    for candidate in backend_path_candidates(base_dir) {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    backend_path_candidates(base_dir)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| base_dir.join("desktop_backend.exe"))
+}
+
+fn backend_path_candidates(base_dir: &Path) -> Vec<PathBuf> {
+    let triple_name = format!(
+        "desktop_backend-{}.{}",
+        backend_target_triple(),
+        platform_backend_extension()
+    );
+    let plain_name = format!("desktop_backend.{}", platform_backend_extension());
+
+    let mut candidates = Vec::new();
+    let is_resources_dir = base_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("resources"))
+        .unwrap_or(false);
+
+    if is_resources_dir {
+        candidates.push(base_dir.join("backend").join(&triple_name));
+        candidates.push(base_dir.join("backend").join(&plain_name));
+        if let Some(parent) = base_dir.parent() {
+            candidates.push(parent.join(&plain_name));
+            candidates.push(parent.join(&triple_name));
+            candidates.push(parent.join("backend").join(&triple_name));
+            candidates.push(parent.join("backend").join(&plain_name));
+        }
+    } else {
+        candidates.push(base_dir.join(&plain_name));
+        candidates.push(base_dir.join(&triple_name));
+        candidates.push(base_dir.join("backend").join(&triple_name));
+        candidates.push(base_dir.join("backend").join(&plain_name));
+        candidates.push(base_dir.join("resources").join("backend").join(&triple_name));
+        candidates.push(base_dir.join("resources").join("backend").join(&plain_name));
+        candidates.push(base_dir.join("resources").join(&plain_name));
+    }
+
+    candidates
 }
 
 fn platform_backend_extension() -> &'static str {
@@ -276,8 +328,6 @@ fn platform_backend_extension() -> &'static str {
         ""
     }
 }
-
-const BACKEND_BUNDLE_STEM: &str = "backend/desktop_backend";
 
 fn backend_target_triple() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -350,4 +400,60 @@ pub fn backend_status(state: State<'_, BackendState>) -> Result<BackendStatus, S
         .lock()
         .map_err(|_| "Backend state lock poisoned".to_string())?;
     Ok(manager.current_status())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_packaged_backend_path_from_dir, resolve_packaged_working_dir};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_case_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("taiwan_alpha_radar_{name}_{unique}"));
+        fs::create_dir_all(&dir).expect("create temp case dir");
+        dir
+    }
+
+    #[test]
+    fn resolves_installed_backend_from_root_layout() {
+        let base = temp_case_dir("root_layout");
+        fs::write(base.join("desktop_backend.exe"), b"binary").expect("write backend");
+        let path = resolve_packaged_backend_path_from_dir(&base);
+
+        assert_eq!(path, base.join("desktop_backend.exe"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn prefers_resource_subdirectory_when_present() {
+        let root = temp_case_dir("resources_layout");
+        let base = root.join("resources");
+        let backend_dir = base.join("backend");
+        fs::create_dir_all(&backend_dir).expect("create backend dir");
+        let expected = backend_dir.join("desktop_backend-x86_64-pc-windows-msvc.exe");
+        fs::write(&expected, b"binary").expect("write triple backend");
+        let path = resolve_packaged_backend_path_from_dir(&base);
+
+        assert_eq!(path, expected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packaged_backend_prefers_project_root_as_working_dir() {
+        let base = temp_case_dir("working_dir");
+        let candidate = base.join("desktop_backend.exe");
+        fs::write(&candidate, b"binary").expect("write backend");
+
+        let working_dir = resolve_packaged_working_dir(&candidate).expect("resolve working dir");
+
+        assert_eq!(working_dir, super::resolve_project_root());
+        let _ = fs::remove_dir_all(base);
+    }
 }

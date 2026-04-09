@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -12,7 +13,10 @@ from dotenv import load_dotenv
 def _runtime_root_candidates() -> list[Path]:
     if getattr(sys, "frozen", False):
         executable_dir = Path(sys.executable).resolve().parent
+        current_dir = Path(os.getcwd()).resolve()
         candidates = [executable_dir, *executable_dir.parents[:2]]
+        if (current_dir / "run.py").is_file():
+            candidates.append(current_dir)
         return list(dict.fromkeys(candidates))
 
     return [Path(__file__).resolve().parent]
@@ -43,5 +47,10 @@ def main() -> int:
     return 0
 
 
+def entrypoint() -> int:
+    multiprocessing.freeze_support()
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint())

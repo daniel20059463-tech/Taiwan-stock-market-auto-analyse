@@ -261,8 +261,21 @@ Invoke-CheckedCommand -FilePath $pythonPath -Arguments ($pythonArgs + @(
     "--specpath", $pyInstallerCacheDir,
     "--paths", $projectRoot,
     "--hidden-import", "run",
+    "--hidden-import", "analyzer",
     "--hidden-import", "sinopac_bridge",
     "--hidden-import", "auto_trader",
+    "--hidden-import", "_cffi_backend",
+    "--collect-all", "nacl",
+    "--collect-all", "cffi",
+    "--collect-all", "shioaji",
+    "--collect-all", "pyrsca",
+    "--collect-all", "pysolace",
+    "--collect-all", "requests",
+    "--collect-all", "filelock",
+    "--collect-all", "base58",
+    "--collect-all", "xxhash",
+    "--collect-all", "loguru",
+    "--collect-all", "sentry_sdk",
     $desktopBackendScript
 )) -FailureMessage "PyInstaller backend packaging failed"
 

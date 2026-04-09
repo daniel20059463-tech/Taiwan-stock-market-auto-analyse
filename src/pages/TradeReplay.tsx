@@ -53,7 +53,7 @@ function buildPortfolioEvents(
   dateStr: string,
   recentTrades: {
     symbol: string;
-    action: "BUY" | "SELL";
+    action: "BUY" | "SELL" | "SHORT" | "COVER";
     price: number;
     netPnl: number;
     ts: number;
@@ -78,10 +78,10 @@ function buildPortfolioEvents(
     .map((trade, index) => ({
       id: index + 1,
       ts: Math.max(0, Math.min(SESSION_DURATION_MS, trade.ts - sessionStart)),
-      type: trade.action,
+      type: trade.action === "SHORT" ? "BUY" : trade.action === "COVER" ? "SELL" : trade.action,
       symbol: trade.symbol,
       price: trade.price,
-      pnl: trade.action === "SELL" ? trade.netPnl : undefined,
+      pnl: trade.action === "SELL" || trade.action === "COVER" ? trade.netPnl : undefined,
       reason: reasonMap[trade.reason] ?? trade.reason,
     }))
     .sort((left, right) => left.ts - right.ts);

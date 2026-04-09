@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
-import { restartBackend } from "./desktopBridge";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { isDesktopRuntime, restartBackend } from "./desktopBridge";
 import { installDesktopUpdate } from "./desktopUpdater";
 import { AppShell } from "./components/AppShell";
 import { DesktopBackendBanner } from "./components/DesktopBackendBanner";
@@ -12,6 +12,7 @@ import { CORE_TW_SYMBOLS, DEFAULT_TW_STOCKS } from "./data/twStocks";
 import { Performance } from "./pages/Performance";
 import { StrategyConfig } from "./pages/StrategyConfig";
 import { StrategyWorkbench } from "./pages/StrategyWorkbench";
+import { TradeMonitor } from "./pages/TradeMonitor";
 import { TradeReplay } from "./pages/TradeReplay";
 import {
   useDesktopBackendRetrying,
@@ -35,6 +36,7 @@ const SYMBOLS = (rawSymbols || CORE_TW_SYMBOLS.join(","))
   .filter(Boolean);
 
 const INSTRUMENTS = DEFAULT_TW_STOCKS;
+const DESKTOP_DEFAULT_ROUTE = isDesktopRuntime() ? "/monitor" : "/";
 
 function DesktopBackendBannerSlot() {
   const desktopRuntimeAvailable = useDesktopRuntimeAvailable();
@@ -47,7 +49,7 @@ function DesktopBackendBannerSlot() {
     setDesktopBackendRetrying(true);
     setDesktopBackendStatus({
       phase: "starting",
-      detail: "正在重新啟動桌面後端…",
+      detail: "正在重新啟動桌面後端。",
       updatedAt: Date.now(),
     } satisfies DesktopBackendStatus);
 
@@ -87,7 +89,7 @@ function DesktopUpdateBannerSlot() {
     setDesktopUpdate({
       ...updateState,
       status: "downloading",
-      message: "正在下載更新…",
+      message: "正在下載更新。",
     } satisfies DesktopUpdateState);
 
     try {
@@ -114,7 +116,7 @@ function DesktopUpdateBannerSlot() {
 
 export function App() {
   return (
-    <ErrorBoundary label="台股模擬交易主畫面">
+    <ErrorBoundary label="前端主畫面">
       <BrowserRouter>
         <MarketDataProvider workerUrl={WS_URL} symbols={SYMBOLS} instruments={INSTRUMENTS}>
           <AppShell
@@ -126,23 +128,28 @@ export function App() {
             }
           >
             <Routes>
-              <Route
-                path="/"
-                element={
-                  <ErrorBoundary label="即時總覽">
-                    <Dashboard
-                      symbols={SYMBOLS}
-                      instruments={INSTRUMENTS}
-                      title="台股模擬交易雷達"
-                    />
-                  </ErrorBoundary>
-                }
-              />
+              <Route path="/" element={DESKTOP_DEFAULT_ROUTE === "/" ? (
+                <ErrorBoundary label="盤中總控台">
+                  <Dashboard
+                    symbols={SYMBOLS}
+                    instruments={INSTRUMENTS}
+                    title="台股模擬交易雷達"
+                  />
+                </ErrorBoundary>
+              ) : <Navigate to={DESKTOP_DEFAULT_ROUTE} replace />} />
               <Route
                 path="/strategy"
                 element={
                   <ErrorBoundary label="策略作戰台">
                     <StrategyWorkbench />
+                  </ErrorBoundary>
+                }
+              />
+              <Route
+                path="/monitor"
+                element={
+                  <ErrorBoundary label="交易監控">
+                    <TradeMonitor />
                   </ErrorBoundary>
                 }
               />

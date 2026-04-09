@@ -4,6 +4,7 @@ import { useConnectionState, usePortfolio } from "../store";
 
 const NAV_ITEMS = [
   { path: "/", label: "盤中總控台" },
+  { path: "/monitor", label: "交易監控" },
   { path: "/strategy", label: "策略作戰台" },
   { path: "/replay", label: "交易回放" },
   { path: "/performance", label: "績效分析" },
@@ -56,13 +57,13 @@ function connectionLabel(state: ReturnType<typeof useConnectionState>): string {
     case "open":
       return "已連線";
     case "reconnecting":
-      return "重連中";
+      return "重新連線";
     case "connecting":
       return "連線中";
     case "closed":
       return "已中斷";
     case "error":
-      return "異常";
+      return "錯誤";
     default:
       return "待命";
   }
@@ -130,7 +131,7 @@ export function AppShell({ children, topBanner }: { children: ReactNode; topBann
               marginBottom: "8px",
             }}
           >
-            Taiwan Market
+            台股交易台
           </div>
           <div style={{ fontSize: "21px", fontWeight: 800, color: palette.text, lineHeight: 1.35 }}>
             台股模擬交易雷達
@@ -170,6 +171,22 @@ export function AppShell({ children, topBanner }: { children: ReactNode; topBann
               {pnl.toLocaleString()}
             </span>
           </div>
+
+          <NavLink
+            to="/monitor"
+            style={{
+              display: "block",
+              border: `1px solid ${palette.accent}`,
+              color: palette.accent,
+              textDecoration: "none",
+              padding: "10px 12px",
+              fontWeight: 700,
+              textAlign: "center",
+              background: "rgba(0,245,255,0.06)",
+            }}
+          >
+            打開交易監控
+          </NavLink>
         </div>
 
         <nav style={{ flex: 1, padding: "12px 0", display: "flex", flexDirection: "column", gap: "2px" }}>
@@ -179,7 +196,7 @@ export function AppShell({ children, topBanner }: { children: ReactNode; topBann
         </nav>
 
         <div style={{ padding: "12px 20px", borderTop: `1px solid ${palette.border}` }}>
-          <div style={{ fontSize: "12px", color: palette.muted }}>單人策略交易平台 v0.2.0</div>
+          <div style={{ fontSize: "12px", color: palette.muted }}>桌面版 v0.1.1</div>
         </div>
       </aside>
 

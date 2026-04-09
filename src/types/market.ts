@@ -206,6 +206,7 @@ export interface DecisionReport {
 
 export interface PaperPosition {
   symbol: string;
+  side?: "long" | "short";
   entryPrice: number;
   currentPrice: number;
   shares: number;
@@ -219,7 +220,7 @@ export interface PaperPosition {
 
 export interface PaperTrade {
   symbol: string;
-  action: "BUY" | "SELL";
+  action: "BUY" | "SELL" | "SHORT" | "COVER";
   price: number;
   shares: number;
   reason: string;

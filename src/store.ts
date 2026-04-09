@@ -103,7 +103,10 @@ function isPaperTrade(value: unknown): value is PaperTrade {
   const trade = value as Record<string, unknown>;
   return (
     typeof trade.symbol === "string" &&
-    (trade.action === "BUY" || trade.action === "SELL") &&
+    (trade.action === "BUY" ||
+      trade.action === "SELL" ||
+      trade.action === "SHORT" ||
+      trade.action === "COVER") &&
     typeof trade.price === "number" &&
     typeof trade.shares === "number" &&
     typeof trade.reason === "string" &&
