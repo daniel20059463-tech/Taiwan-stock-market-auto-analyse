@@ -100,8 +100,10 @@ void main() {
 
     await _pumpStockDetailPage(tester, gateway: gateway);
 
-    expect(find.byKey(const Key('stock-detail-header')), findsOneWidget);
-    expect(find.text('--'), findsNWidgets(8));
+    final header = find.byKey(const Key('stock-detail-header'));
+
+    expect(header, findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('--')), findsNWidgets(8));
   });
 
   testWidgets('Stock detail header updates from a live quote snapshot', (tester) async {
@@ -125,14 +127,17 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('780.00'), findsOneWidget);
-    expect(find.text('+10.00'), findsOneWidget);
-    expect(find.text('+1.30%'), findsOneWidget);
-    expect(find.text('772.00'), findsOneWidget);
-    expect(find.text('785.00'), findsOneWidget);
-    expect(find.text('768.00'), findsOneWidget);
-    expect(find.text('770.00'), findsOneWidget);
-    expect(find.text('34500'), findsOneWidget);
+    final header = find.byKey(const Key('stock-detail-header'));
+
+    expect(header, findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('780.00')), findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('+10.00')), findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('+1.30%')), findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('772.00')), findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('785.00')), findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('768.00')), findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('770.00')), findsOneWidget);
+    expect(find.descendant(of: header, matching: find.text('34500')), findsOneWidget);
   });
   testWidgets('個股詳細頁顯示中文區塊與分時線', (tester) async {
     final gateway = _FakeGateway();
