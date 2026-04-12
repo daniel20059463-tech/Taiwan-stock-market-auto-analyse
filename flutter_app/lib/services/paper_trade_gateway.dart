@@ -176,8 +176,12 @@ class WsPaperTradeGateway implements PaperTradeGateway {
   WebSocket? _quoteDetailSocket;
   String? _quoteDetailSymbol;
   Future<void>? _connectingQuoteDetail;
+  WebSocket? _liveQuoteSocket;
+  String? _liveQuoteSymbol;
+  Future<void>? _connectingLiveQuote;
   StreamController<OrderBookSnapshot>? _orderBookController;
   StreamController<TradeTapeSnapshot>? _tradeTapeController;
+  StreamController<LiveQuoteSnapshot>? _liveQuoteController;
 
   @override
   Future<List<IntradayTrendPoint>> loadIntradayTrend(String symbol) async {
@@ -243,7 +247,195 @@ class WsPaperTradeGateway implements PaperTradeGateway {
 
   @override
   Stream<LiveQuoteSnapshot> subscribeLiveQuote(String symbol) {
-    return Stream<LiveQuoteSnapshot>.empty();
+    _liveQuoteController ??= StreamController<LiveQuoteSnapshot>.broadcast(
+      onCancel: () {
+        if (!(_liveQuoteController?.hasListener ?? false)) {
+          unawaited(_closeLiveQuoteSocket());
+        }
+      },
+    );
+    _liveQuoteSymbol = symbol;
+    unawaited(_ensureLiveQuoteSocket());
+    return _liveQuoteController!.stream.where((snapshot) => snapshot.symbol == symbol);
+  }
+
+  Future<void> _ensureLiveQuoteSocket() async {
+    final symbol = _liveQuoteSymbol;
+    if (symbol == null) {
+      return;
+    }
+    if (_liveQuoteSocket != null && _liveQuoteSymbol == symbol) {
+      return;
+    }
+    if (_connectingLiveQuote != null) {
+      await _connectingLiveQuote;
+      if (_liveQuoteSocket != null && _liveQuoteSymbol == symbol) {
+        return;
+      }
+    }
+    _connectingLiveQuote = _openLiveQuoteSocket();
+    try {
+      await _connectingLiveQuote;
+    } finally {
+      _connectingLiveQuote = null;
+    }
+  }
+
+  Future<void> _openLiveQuoteSocket() async {
+    await _closeLiveQuoteSocket();
+    final symbol = _liveQuoteSymbol;
+    if (symbol == null) {
+      return;
+    }
+
+    final socket = await WebSocket.connect(endpoint).timeout(timeout);
+    _liveQuoteSocket = socket;
+
+    unawaited(_listenLiveQuoteSocket(socket));
+    socket.add(jsonEncode(<String, Object>{
+      'type': 'subscribe',
+      'symbols': <String>[symbol],
+    }));
+  }
+
+  Future<void> _listenLiveQuoteSocket(WebSocket socket) async {
+    try {
+      await for (final raw in socket.timeout(timeout)) {
+        if (raw is! String) {
+          continue;
+        }
+        final decoded = jsonDecode(raw);
+        if (decoded is List) {
+          for (final item in decoded.whereType<Map>()) {
+            final snapshot = _tryParseLiveQuoteSnapshot(Map<String, dynamic>.from(item));
+            if (snapshot != null) {
+              _liveQuoteController?.add(snapshot);
+            }
+          }
+          continue;
+        }
+        if (decoded is! Map<String, dynamic>) {
+          continue;
+        }
+
+        final nestedPayloads = <dynamic>[
+          decoded['data'],
+          decoded['payload'],
+          decoded['quote'],
+          decoded['quotes'],
+          decoded['tick'],
+          decoded['ticks'],
+          decoded['snapshot'],
+          decoded['snapshots'],
+        ];
+        var emitted = false;
+        for (final nested in nestedPayloads) {
+          if (nested is List) {
+            for (final item in nested.whereType<Map>()) {
+              final snapshot = _tryParseLiveQuoteSnapshot(Map<String, dynamic>.from(item));
+              if (snapshot != null) {
+                _liveQuoteController?.add(snapshot);
+                emitted = true;
+              }
+            }
+            if (emitted) {
+              break;
+            }
+            continue;
+          }
+          if (nested is Map) {
+            final snapshot = _tryParseLiveQuoteSnapshot(Map<String, dynamic>.from(nested));
+            if (snapshot != null) {
+              _liveQuoteController?.add(snapshot);
+              emitted = true;
+              break;
+            }
+          }
+        }
+        if (emitted) {
+          continue;
+        }
+
+        final snapshot = _tryParseLiveQuoteSnapshot(decoded);
+        if (snapshot != null) {
+          _liveQuoteController?.add(snapshot);
+        }
+      }
+    } on TimeoutException {
+      // Ignore stale sockets; callers will reconnect on the next subscribe.
+    } catch (error) {
+      _liveQuoteController?.addError(error);
+    } finally {
+      if (identical(_liveQuoteSocket, socket)) {
+        _liveQuoteSocket = null;
+      }
+      await socket.close();
+    }
+  }
+
+  Future<void> _closeLiveQuoteSocket() async {
+    final socket = _liveQuoteSocket;
+    _liveQuoteSocket = null;
+    if (socket == null) {
+      return;
+    }
+    await socket.close();
+  }
+
+  LiveQuoteSnapshot? _tryParseLiveQuoteSnapshot(Map<String, dynamic> json) {
+    final symbol = _asString(
+      json['symbol'] ?? json['code'] ?? json['ticker'] ?? json['stock_no'],
+    );
+    final price = _asDouble(
+      json['price'] ?? json['last'] ?? json['close'] ?? json['trade_price'] ?? json['deal_price'] ?? json['matchPrice'],
+    );
+    if (symbol == null || price == null) {
+      return null;
+    }
+
+    return LiveQuoteSnapshot(
+      symbol: symbol,
+      price: price,
+      previousClose: _asDouble(
+            json['previousClose'] ?? json['previous_close'] ?? json['referencePrice'] ?? json['reference_price'],
+          ) ??
+          0,
+      open: _asDouble(json['open']) ?? 0,
+      high: _asDouble(json['high']) ?? 0,
+      low: _asDouble(json['low']) ?? 0,
+      totalVolume: _asInt(
+            json['totalVolume'] ?? json['total_volume'] ?? json['accVolume'] ?? json['acc_volume'] ?? json['cumulativeVolume'] ?? json['cumulative_volume'],
+          ) ??
+          0,
+      changePct: _asDouble(
+            json['changePct'] ?? json['change_pct'] ?? json['pctChange'] ?? json['percentChange'] ?? json['change_percent'],
+          ) ??
+          0,
+    );
+  }
+
+  String? _asString(dynamic value) {
+    return value is String && value.isNotEmpty ? value : null;
+  }
+
+  double? _asDouble(dynamic value) {
+    if (value is num) {
+      return value.toDouble();
+    }
+    if (value is String) {
+      return double.tryParse(value);
+    }
+    return null;
+  }
+
+  int? _asInt(dynamic value) {
+    if (value is num) {
+      return value.toInt();
+    }
+    if (value is String) {
+      return int.tryParse(value);
+    }
+    return null;
   }
 
   Future<void> _ensureQuoteDetailSubscription(String symbol) async {
