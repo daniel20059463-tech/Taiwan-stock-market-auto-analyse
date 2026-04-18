@@ -329,7 +329,13 @@ class AutoTrader:
                 f"開盤價 {open_price:.2f}（停損 {position.stop_price:.2f}，進場 {position.entry_price:.2f}）\n"
                 f"以開盤價強制平倉，損益 {gap_pct:+.2f}%"
             )
-            await self._paper_sell(symbol, open_price, "STOP_LOSS", gap_pct, ts_ms)
+            await self._execution.execute_sell(
+                symbol=symbol,
+                price=open_price,
+                reason="STOP_LOSS",
+                pct_from_entry=gap_pct,
+                ts_ms=ts_ms,
+            )
 
         elif position.side == "short" and open_price > position.stop_price:
             gap_pct = (position.entry_price - open_price) / position.entry_price * 100
@@ -342,7 +348,13 @@ class AutoTrader:
                 f"開盤價 {open_price:.2f}（停損 {position.stop_price:.2f}，進場 {position.entry_price:.2f}）\n"
                 f"以開盤價強制回補，損益 {gap_pct:+.2f}%"
             )
-            await self._paper_cover(symbol, open_price, "STOP_LOSS", gap_pct, ts_ms)
+            await self._execution.execute_cover(
+                symbol=symbol,
+                price=open_price,
+                reason="STOP_LOSS",
+                pct_from_entry=gap_pct,
+                ts_ms=ts_ms,
+            )
 
     def _update_limit_lock_state(self, symbol: str, change_pct: float, payload: dict[str, Any]) -> None:
         """更新漲跌停鎖死狀態。"""
@@ -655,11 +667,11 @@ class AutoTrader:
             return
 
         target_price = self._risk.calc_target_price(price, stop_price)
-        await self._paper_buy(
-            symbol,
-            price,
-            change_pct,
-            ts_ms,
+        await self._execution.execute_buy(
+            symbol=symbol,
+            price=price,
+            change_pct=change_pct,
+            ts_ms=ts_ms,
             stop_price=stop_price,
             target_price=target_price,
             atr=atr,
@@ -732,7 +744,13 @@ class AutoTrader:
             "time_exit": "TIME_EXIT",
         }
         mapped_reason = reason_map.get(judgment.exit_reason_code or "", "AI_EXIT")
-        await self._paper_sell(symbol, price, mapped_reason, pct_from_entry, ts_ms)
+        await self._execution.execute_sell(
+            symbol=symbol,
+            price=price,
+            reason=mapped_reason,
+            pct_from_entry=pct_from_entry,
+            ts_ms=ts_ms,
+        )
 
     def _build_market_source_events(
         self,
@@ -1050,7 +1068,13 @@ class AutoTrader:
 
         if reason:
             pct_from_entry = (price - position.entry_price) / position.entry_price * 100
-            await self._paper_sell(symbol, price, reason, pct_from_entry, ts_ms)
+            await self._execution.execute_sell(
+                symbol=symbol,
+                price=price,
+                reason=reason,
+                pct_from_entry=pct_from_entry,
+                ts_ms=ts_ms,
+            )
 
     async def _paper_sell(
         self,
@@ -1435,11 +1459,11 @@ class AutoTrader:
                 debate_winner=bundle.debate_winner,
             )
         )
-        await self._paper_short(
-            symbol,
-            price,
-            change_pct,
-            ts_ms,
+        await self._execution.execute_short(
+            symbol=symbol,
+            price=price,
+            change_pct=change_pct,
+            ts_ms=ts_ms,
             stop_price=short_stop,
             target_price=short_target,
             atr=atr,
@@ -1533,7 +1557,13 @@ class AutoTrader:
 
         if reason:
             pct_from_entry = (position.entry_price - price) / position.entry_price * 100
-            await self._paper_cover(symbol, price, reason, pct_from_entry, ts_ms)
+            await self._execution.execute_cover(
+                symbol=symbol,
+                price=price,
+                reason=reason,
+                pct_from_entry=pct_from_entry,
+                ts_ms=ts_ms,
+            )
 
     async def _paper_cover(
         self,
@@ -1662,10 +1692,22 @@ class AutoTrader:
             price = self._last_prices.get(symbol, position.entry_price)
             if position.side == "short":
                 pct = (position.entry_price - price) / position.entry_price * 100
-                await self._paper_cover(symbol, price, "EOD", pct, ts_ms)
+                await self._execution.execute_cover(
+                    symbol=symbol,
+                    price=price,
+                    reason="EOD",
+                    pct_from_entry=pct,
+                    ts_ms=ts_ms,
+                )
             else:
                 pct = (price - position.entry_price) / position.entry_price * 100
-                await self._paper_sell(symbol, price, "EOD", pct, ts_ms)
+                await self._execution.execute_sell(
+                    symbol=symbol,
+                    price=price,
+                    reason="EOD",
+                    pct_from_entry=pct,
+                    ts_ms=ts_ms,
+                )
 
         await self._send_performance_report()
         await self._check_sector_rotation(ts_ms)
@@ -1953,7 +1995,13 @@ class AutoTrader:
             raise ValueError("share_mismatch")
 
         pct_from_entry = ((price - position.entry_price) / position.entry_price * 100) if position.entry_price else 0.0
-        await self._paper_sell(symbol, price, "MANUAL", pct_from_entry, ts_ms)
+        await self._execution.execute_sell(
+            symbol=symbol,
+            price=price,
+            reason="MANUAL",
+            pct_from_entry=pct_from_entry,
+            ts_ms=ts_ms,
+        )
         return self.get_portfolio_snapshot()
 
     def _schedule_eod_report(self, ts_ms: int) -> None:
@@ -2333,11 +2381,11 @@ class AutoTrader:
                 debate_winner=bundle.debate_winner,
             )
         )
-        await self._paper_buy(
-            symbol,
-            price,
-            change_pct,
-            ts_ms,
+        await self._execution.execute_buy(
+            symbol=symbol,
+            price=price,
+            change_pct=change_pct,
+            ts_ms=ts_ms,
             stop_price=stop_price,
             target_price=target_price,
             atr=atr,

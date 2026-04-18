@@ -104,6 +104,32 @@ async def test_execute_manual_trade_buy_delegates_to_execution_service() -> None
 
 
 @pytest.mark.asyncio
+async def test_execute_manual_trade_sell_delegates_to_execution_service() -> None:
+    trader = _make_trader()
+    await trader.execute_manual_trade(symbol="2330", action="BUY", shares=1000, ts_ms=1_775_600_000_000)
+    calls: list[tuple[str, str]] = []
+
+    class _FakeExecution:
+        async def execute_buy(self, **kwargs):
+            raise AssertionError("unexpected buy")
+
+        async def execute_sell(self, **kwargs):
+            calls.append(("SELL", kwargs["symbol"]))
+
+        async def execute_short(self, **kwargs):
+            raise AssertionError("unexpected short")
+
+        async def execute_cover(self, **kwargs):
+            raise AssertionError("unexpected cover")
+
+    trader._execution = _FakeExecution()
+
+    await trader.execute_manual_trade(symbol="2330", action="SELL", shares=1000, ts_ms=1_775_600_060_000)
+
+    assert calls == [("SELL", "2330")]
+
+
+@pytest.mark.asyncio
 async def test_execute_manual_trade_buy_creates_long_position() -> None:
     trader = _make_trader()
 
