@@ -36,6 +36,7 @@ from trading import (
     PaperPosition,
     PositionBook,
     TradeRecord,
+    SwingRuntimeCoordinator,
     build_daily_report_payload,
 )
 
@@ -180,7 +181,7 @@ class AutoTrader:
 
         # Pre-open watchlist: stocks with consecutive institutional buying
         self._preopen_watchlist: set[str] = set()
-        self._retail_flow_watch_states: dict[str, str] = {}
+        self._swing_runtime = SwingRuntimeCoordinator()
 
         # Sector rotation: cached today's hot/cold sector flow + alert dedup
         self._sector_flows_today: dict[str, Any] = {}   # sector -> SectorFlowSnapshot
@@ -305,7 +306,7 @@ class AutoTrader:
             self._eod_report_task = None
             self._last_eod_report_date = None
             self._market_change_pct = 0.0
-            self._retail_flow_watch_states.clear()
+            self._swing_runtime.reset_for_new_day()
             self._build_preopen_watchlist()
 
     async def _check_overnight_gap(self, symbol: str, open_price: float, ts_ms: int) -> None:
@@ -614,7 +615,7 @@ class AutoTrader:
     ) -> None:
         position = self._book.positions.get(symbol)
         if position is not None and position.side == "long":
-            self._retail_flow_watch_states[symbol] = "entered"
+            self._swing_runtime.mark_entered(symbol)
             await self._check_retail_flow_exit(symbol, price, ts_ms)
             return
         if position is not None:
@@ -645,18 +646,18 @@ class AutoTrader:
         consecutive_days = self._institutional_flow_cache.consecutive_trust_buy_days(
             symbol, self._swing_trade_date(), n=5
         )
-        watch_state = self._retail_flow_strategy.classify_watch_state(
+        watch_state = self._swing_runtime.classify_entry_state(
+            symbol=symbol,
             flow_score=flow_score,
             above_ma10=self._is_above_ma10(symbol, price),
             volume_confirmed=self._is_volume_confirmed(symbol),
             recent_runup_pct=change_pct,
             consecutive_trust_days=consecutive_days,
+            classifier=self._retail_flow_strategy.classify_watch_state,
         )
-        previous_watch_state = self._retail_flow_watch_states.get(symbol)
-        self._retail_flow_watch_states[symbol] = watch_state
         if not self._retail_flow_strategy.should_enter_position(watch_state=watch_state):
             return
-        if previous_watch_state in {"ready_to_buy", "entered"}:
+        if not self._swing_runtime.should_trigger_entry(symbol, watch_state):
             return
 
         atr = self._daily_atr(symbol)
@@ -678,7 +679,7 @@ class AutoTrader:
             decision_report=None,
             shares=shares,
         )
-        self._retail_flow_watch_states[symbol] = "entered"
+        self._swing_runtime.mark_entered(symbol)
         logger.info(
             "SwingEntry %s @ %.2f shares=%d stop=%.2f target=%.2f atr=%.2f (籌碼為前日 T+1 資料)",
             symbol, price, shares, stop_price, target_price, atr or 0.0,
