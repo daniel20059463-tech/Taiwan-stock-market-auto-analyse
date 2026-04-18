@@ -9,6 +9,8 @@ __pycache__/
 .superpowers/
 .claude/
 *.log
+logs/
+tmp/
 run_stdout.log
 run_stderr.log
 run_live_stdout.log
