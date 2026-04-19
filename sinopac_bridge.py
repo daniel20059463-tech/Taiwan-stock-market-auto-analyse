@@ -1,10 +1,12 @@
 ﻿from __future__ import annotations
 
 import asyncio
+from collections import deque
 import datetime
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any
 from urllib.error import URLError
@@ -12,13 +14,20 @@ from urllib.request import urlopen
 
 import websockets
 import websockets.server
+from quote_runtime import (
+    QuoteDetailBroadcaster,
+    NativeOrderBookBuffers,
+    NativeTradeTapeBuffers,
+    VisibleSubscriptionManager,
+    load_shioaji_stock_universe,
+)
 
 logger = logging.getLogger(__name__)
 
 # ?? ?啗鈭斗??挾撣豢 ??????????????????????????????????????????????????????????
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
-_MARKET_OPEN_MIN  = 8 * 60   # 08:00
-_MARKET_CLOSE_MIN = 17 * 60  # 17:00
+_MARKET_OPEN_MIN  = 9 * 60        # 09:00
+_MARKET_CLOSE_MIN = 13 * 60 + 30  # 13:30
 _LIMIT_UP_PCT = 9.5
 _LIMIT_DOWN_PCT = -9.5
 _TAIEX_SYMBOL = "TSE001"          # 加權指數在 shioaji 的合約代號
@@ -53,6 +62,7 @@ class SinopacCollector:
         self._api: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._clients: set[websockets.server.WebSocketServerProtocol] = set()
+        self._quote_detail_subscriptions: dict[websockets.server.WebSocketServerProtocol, str | None] = {}
         self._accepting = True
         self._server: websockets.server.WebSocketServer | None = None
         self._broadcast_task: asyncio.Task[None] | None = None
@@ -68,6 +78,36 @@ class SinopacCollector:
         self._last_tick_monotonic: float = 0.0
         self._watchdog_task: asyncio.Task[None] | None = None
         self._reconnecting: bool = False
+        self._native_order_books = NativeOrderBookBuffers(timezone=_TZ_TW)
+        self._native_trade_tapes = NativeTradeTapeBuffers(
+            symbols=symbols,
+            timezone=_TZ_TW,
+            epoch_ms_converter=_to_epoch_milliseconds,
+            safe_number=_safe_number,
+            coalesce_number=_coalesce_number,
+        )
+        self._order_book_buffers = self._native_order_books.buffers
+        self._trade_tape_buffers = self._native_trade_tapes.buffers
+        self._last_trade_prices = self._native_trade_tapes.last_trade_prices
+        self.visible_symbols: set[str] = set(symbols)
+        self._subscribed_visible_symbols: set[str] = set()
+        self._symbol_contracts: dict[str, Any] = {}
+        self._reconnect_lock = threading.Lock()
+        self._subscription_manager = VisibleSubscriptionManager(
+            symbols=self._symbols,
+            get_api=lambda: self._api,
+            get_contract_sync=self._get_contract_sync,
+            symbol_contracts=self._symbol_contracts,
+            visible_symbols=self.visible_symbols,
+            subscribed_visible_symbols=self._subscribed_visible_symbols,
+            logger=logger,
+        )
+        self._detail_broadcaster = QuoteDetailBroadcaster(
+            clients=self._clients,
+            subscriptions=self._quote_detail_subscriptions,
+            build_order_book_snapshot=self._build_order_book_snapshot,
+            build_trade_tape_snapshot=self._build_trade_tape_snapshot,
+        )
 
     def _get_contract_sync(self, symbol: str) -> Any | None:
         if self._api is None:
@@ -79,6 +119,18 @@ class SinopacCollector:
             except Exception:
                 continue
         return None
+
+    def set_visible_symbols(self, symbols: list[str]) -> None:
+        self._subscription_manager.visible_symbols = self.visible_symbols
+        self._subscription_manager.subscribed_visible_symbols = self._subscribed_visible_symbols
+        self._subscription_manager._symbol_contracts = self._symbol_contracts
+        self._subscription_manager.set_visible_symbols(symbols)
+
+    def _sync_visible_symbol_subscriptions(self) -> None:
+        self._subscription_manager.visible_symbols = self.visible_symbols
+        self._subscription_manager.subscribed_visible_symbols = self._subscribed_visible_symbols
+        self._subscription_manager._symbol_contracts = self._symbol_contracts
+        self._subscription_manager.sync()
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -152,18 +204,19 @@ class SinopacCollector:
 
     def _reconnect_sync(self) -> None:
         """斷線重連：登出舊 API → 重新 login + subscribe。"""
-        self._reconnecting = True
-        try:
-            if self._api is not None:
-                try:
-                    self._api.logout()
-                except Exception:
-                    pass
-                self._api = None
-            self._login_and_subscribe_sync()
-            self._last_tick_monotonic = time.monotonic()
-        finally:
-            self._reconnecting = False
+        with self._reconnect_lock:
+            self._reconnecting = True
+            try:
+                if self._api is not None:
+                    try:
+                        self._api.logout()
+                    except Exception:
+                        pass
+                    self._api = None
+                self._login_and_subscribe_sync()
+                self._last_tick_monotonic = time.monotonic()
+            finally:
+                self._reconnecting = False
 
     def _offer_tick(self, payload: dict[str, Any]) -> None:
         symbol = str(payload.get("symbol", ""))
@@ -182,9 +235,18 @@ class SinopacCollector:
             return
         loop.call_soon_threadsafe(self._offer_tick, payload)
 
+    def _offer_bidask(self, bidask: Any) -> None:
+        self._apply_native_bidask(bidask)
+
+    def _offer_bidask_threadsafe(self, bidask: Any) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._offer_bidask, bidask)
+
     def _login_and_subscribe_sync(self) -> None:
         import shioaji as sj
-        from shioaji.constant import QuoteType
+        from shioaji.constant import QuoteType, QuoteVersion
 
         api = sj.Shioaji(simulation=self._simulation)
         api.login(api_key=self._api_key, secret_key=self._secret_key)
@@ -192,7 +254,7 @@ class SinopacCollector:
         loop = self._loop
         today = datetime.date.today().strftime("%Y-%m-%d")
 
-        contracts_by_symbol: dict[str, Any] = {}
+        self._symbol_contracts = {}
         should_bootstrap = self._bootstrap_bar_limit > 0 and len(self._symbols) <= self._bootstrap_symbol_limit
         official_meta = _load_twse_seed_quotes(self._symbols)
         if not should_bootstrap:
@@ -209,7 +271,7 @@ class SinopacCollector:
                 logger.warning("Contract load failed for %s: %s", symbol, exc)
                 continue
 
-            contracts_by_symbol[symbol] = contract
+            self._symbol_contracts[symbol] = contract
             meta = self._load_symbol_meta_sync(contract)
             if symbol in official_meta:
                 meta = _merge_seed_meta(meta, official_meta[symbol])
@@ -218,38 +280,49 @@ class SinopacCollector:
             if should_bootstrap:
                 self._bootstrap_kbars_sync(symbol, today)
 
-        @api.on_tick_stk_v1()
+        quote = api.quote
+
         def _on_tick(exchange: Any, tick: Any) -> None:
             if not self._accepting or loop is None or loop.is_closed():
                 return
             symbol = str(getattr(tick, "code", ""))
+            self._record_native_tick_tape(tick)
             payload = _normalise_tick(tick, self._market_meta.get(symbol, {}))
             if payload is None:
                 return
             self._offer_tick_threadsafe(payload)
 
-        for symbol, contract in contracts_by_symbol.items():
-            try:
-                api.quote.subscribe(contract, quote_type=QuoteType.Tick)
-                logger.info("Subscribed live tick: %s", symbol)
-            except Exception as exc:
-                logger.warning("Subscription failed for %s: %s", symbol, exc)
+        def _on_bidask(exchange: Any, bidask: Any) -> None:
+            if not self._accepting or loop is None or loop.is_closed():
+                return
+            self._offer_bidask_threadsafe(bidask)
+
+        quote.set_on_tick_stk_v1_callback(_on_tick)
+        quote.set_on_bidask_stk_v1_callback(_on_bidask)
+
+        self._subscribed_visible_symbols.clear()
+        self._sync_visible_symbol_subscriptions()
 
         # ── 訂閱加權指數（大盤方向過濾）────────────────────────────────────────
-        try:
-            taiex_contract = api.Contracts.Indices.TSE[_TAIEX_SYMBOL]
-            snaps = api.snapshots([taiex_contract])
-            if snaps:
-                prev = _safe_number(snaps[0], ("reference", "reference_price", "close"), default=None)
-                if prev and prev > 0:
-                    self._taiex_prev_close = prev
-            api.quote.subscribe(taiex_contract, quote_type=QuoteType.Tick)
-            logger.info(
-                "Subscribed TAIEX index (%s) prev_close=%.2f",
-                _TAIEX_SYMBOL, self._taiex_prev_close,
-            )
-        except Exception as exc:
-            logger.warning("TAIEX index subscription failed（大盤過濾將不生效）: %s", exc)
+        taiex_contract = _get_taiex_contract(api)
+        if taiex_contract is not None:
+            try:
+                snaps = api.snapshots([taiex_contract])
+                if snaps:
+                    prev = _safe_number(
+                        snaps[0],
+                        ("reference", "reference_price", "previous_close", "yesterday_close"),
+                        default=None,
+                    )
+                    if prev and prev > 0:
+                        self._taiex_prev_close = prev
+                quote.subscribe(taiex_contract, quote_type=QuoteType.Tick, version=QuoteVersion.v1)
+                logger.info(
+                    "Subscribed TAIEX index (%s) prev_close=%.2f",
+                    _TAIEX_SYMBOL, self._taiex_prev_close,
+                )
+            except Exception as exc:
+                logger.warning("TAIEX index subscription failed（大盤過濾將不生效）: %s", exc)
 
         def _on_idx_tick(exchange: Any, tick: Any) -> None:
             """接收加權指數 tick，更新 AutoTrader 的大盤漲跌幅。"""
@@ -275,7 +348,7 @@ class SinopacCollector:
             except Exception as exc:
                 logger.debug("TAIEX tick normalisation error: %s", exc)
 
-        if not _bind_index_tick_handler(api, _on_idx_tick):
+        if taiex_contract is not None and not _bind_index_tick_handler(api, _on_idx_tick):
             logger.warning("TAIEX index tick hook unavailable in this Shioaji version; market filter disabled")
 
     def _load_symbol_meta_sync(self, contract: Any) -> dict[str, Any]:
@@ -299,7 +372,11 @@ class SinopacCollector:
             if snapshots:
                 snapshot = snapshots[0]
                 meta["lastPrice"] = _safe_number(snapshot, ("close", "close_price", "price", "last_price"), default=None)
-                meta["previousClose"] = _safe_number(snapshot, ("reference", "reference_price", "close"), default=None)
+                meta["previousClose"] = _safe_number(
+                    snapshot,
+                    ("reference", "reference_price", "previous_close", "yesterday_close"),
+                    default=None,
+                )
                 meta["open"] = _safe_number(snapshot, ("open",), default=meta["previousClose"])
                 meta["high"] = _safe_number(snapshot, ("high",), default=meta["open"])
                 meta["low"] = _safe_number(snapshot, ("low",), default=meta["open"])
@@ -408,7 +485,7 @@ class SinopacCollector:
 
         today = datetime.date.today().strftime("%Y-%m-%d")
         try:
-            kbars = self._api.kbars(contract, start=today, end=today)
+            kbars = self._load_kbars_with_retry_sync(symbol, contract, start=today, end=today, context="session")
         except Exception as exc:
             logger.warning("session kbars failed for %s: %s", symbol, exc)
             return []
@@ -444,7 +521,7 @@ class SinopacCollector:
         end_str = end_date.strftime("%Y-%m-%d")
 
         try:
-            kbars = self._api.kbars(contract, start=start_date, end=end_str)
+            kbars = self._load_kbars_with_retry_sync(symbol, contract, start=start_date, end=end_str, context="history")
         except Exception as exc:
             logger.warning("history kbars failed for %s: %s", symbol, exc)
             return []
@@ -481,6 +558,47 @@ class SinopacCollector:
 
         return [daily[key] for key in sorted(daily.keys())][-max(1, months * 31) :]
 
+    def _load_kbars_with_retry_sync(
+        self,
+        symbol: str,
+        contract: Any,
+        *,
+        start: str,
+        end: str,
+        context: str,
+    ) -> Any:
+        api = self._api
+        if api is None:
+            raise RuntimeError("shioaji_api_unavailable")
+
+        try:
+            return api.kbars(contract, start=start, end=end)
+        except Exception as first_exc:
+            logger.warning("%s kbars retry after initial failure for %s: %s", context, symbol, first_exc)
+            self._reconnect_sync()
+            api = self._api
+            retry_contract = self._get_contract_sync(symbol) or contract
+            if api is None:
+                raise first_exc
+            try:
+                return api.kbars(retry_contract, start=start, end=end)
+            except Exception as retry_exc:
+                detail = str(retry_exc)
+                if "StatusCode: 503" in detail and "請1分鐘後再重新登入" in detail:
+                    logger.warning(
+                        "%s kbars hit relogin cooldown for %s; waiting 65 seconds before second retry",
+                        context,
+                        symbol,
+                    )
+                    time.sleep(65.0)
+                    self._reconnect_sync()
+                    api = self._api
+                    retry_contract = self._get_contract_sync(symbol) or retry_contract
+                    if api is None:
+                        raise retry_exc
+                    return api.kbars(retry_contract, start=start, end=end)
+                raise
+
     async def _handle_ws_message(self, websocket: websockets.server.WebSocketServerProtocol, raw: str) -> None:
         try:
             payload = json.loads(raw)
@@ -490,12 +608,83 @@ class SinopacCollector:
         if not isinstance(payload, dict):
             return
 
-        symbol = str(payload.get("symbol", "")).strip()
-        if not symbol:
+        if payload.get("type") == "set_visible_symbols":
+            raw_symbols = payload.get("symbols", [])
+            if not isinstance(raw_symbols, list):
+                return
+            self.set_visible_symbols([str(symbol).strip() for symbol in raw_symbols if str(symbol).strip()])
             return
 
         loop = self._loop
         if loop is None:
+            return
+
+        symbol = str(payload.get("symbol", "")).strip()
+        if not symbol:
+            return
+
+        if payload.get("type") == "paper_trade":
+            if self._auto_trader is None:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "PAPER_TRADE_RESULT",
+                            "status": "error",
+                            "error": "paper_trade_unavailable",
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                return
+            try:
+                snapshot = await self._auto_trader.execute_manual_trade(
+                    symbol=symbol,
+                    action=str(payload.get("action", "")).upper().strip(),
+                    shares=int(payload.get("shares", 1000)),
+                    ts_ms=int(payload.get("ts", time.time() * 1000)),
+                )
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "PAPER_TRADE_RESULT",
+                            "status": "ok",
+                            "symbol": symbol,
+                            "action": str(payload.get("action", "")).upper().strip(),
+                            "shares": int(payload.get("shares", 1000)),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                msg = json.dumps(snapshot, separators=(",", ":"))
+                dead: list[websockets.server.WebSocketServerProtocol] = []
+                for client in list(self._clients):
+                    try:
+                        await client.send(msg)
+                    except Exception:
+                        dead.append(client)
+                for client in dead:
+                    self._clients.discard(client)
+            except Exception as exc:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "PAPER_TRADE_RESULT",
+                            "status": "error",
+                            "error": str(exc),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            return
+
+        if payload.get("type") == "subscribe_quote_detail":
+            self._quote_detail_subscriptions[websocket] = symbol if symbol in self._symbols else None
+            if symbol in self._symbols:
+                await self._send_quote_detail_snapshots(websocket, symbol)
+            return
+
+        if payload.get("type") == "unsubscribe_quote_detail":
+            self._quote_detail_subscriptions[websocket] = None
             return
 
         if payload.get("type") == "session_bars":
@@ -533,6 +722,7 @@ class SinopacCollector:
         path: str = "/",
     ) -> None:
         self._clients.add(websocket)
+        self._quote_detail_subscriptions[websocket] = None
         remote = getattr(websocket, "remote_address", "?")
         logger.info("Dashboard connected: %s (total=%d)", remote, len(self._clients))
         try:
@@ -549,6 +739,7 @@ class SinopacCollector:
                     await self._handle_ws_message(websocket, raw)
         finally:
             self._clients.discard(websocket)
+            self._quote_detail_subscriptions.pop(websocket, None)
             logger.info("Dashboard disconnected: %s (total=%d)", remote, len(self._clients))
 
     async def _broadcast_loop(self) -> None:
@@ -585,6 +776,11 @@ class SinopacCollector:
                         dead.append(client)
                 for client in dead:
                     self._clients.discard(client)
+                    self._quote_detail_subscriptions.pop(client, None)
+
+            touched_symbols = {str(payload.get("symbol", "")) for payload in batch if payload.get("symbol")}
+            for symbol in touched_symbols:
+                await self._broadcast_quote_detail(symbol)
 
             if self._auto_trader is not None:
                 portfolio_dirty = False
@@ -607,8 +803,113 @@ class SinopacCollector:
                                 dead2.append(client)
                         for client in dead2:
                             self._clients.discard(client)
+                            self._quote_detail_subscriptions.pop(client, None)
                     except Exception as exc:
                         logger.warning("Portfolio broadcast error: %s", exc)
+
+    async def _broadcast_quote_detail(self, symbol: str) -> None:
+        await self._detail_broadcaster.broadcast_quote_detail(symbol)
+
+    async def _send_quote_detail_snapshots(
+        self,
+        websocket: websockets.server.WebSocketServerProtocol,
+        symbol: str,
+    ) -> None:
+        await self._detail_broadcaster.send_quote_detail_snapshots(websocket, symbol)
+
+    def _build_order_book_snapshot(self, symbol: str) -> dict[str, Any]:
+        return self._native_order_books.build_snapshot(symbol)
+
+    def _build_trade_tape_snapshot(self, symbol: str) -> dict[str, Any]:
+        return self._native_trade_tapes.build_snapshot(symbol)
+
+    def _apply_native_bidask(self, bidask: Any) -> None:
+        symbol = self._native_order_books.apply_bidask(bidask)
+        if symbol:
+            self._queue_quote_detail_refresh(symbol)
+
+    def _queue_quote_detail_refresh(self, symbol: str) -> None:
+        self._detail_broadcaster.queue_quote_detail_refresh(loop=self._loop, symbol=symbol)
+
+    def _record_native_tick_tape(self, tick: Any) -> None:
+        self._native_trade_tapes.record_native_tick_tape(tick)
+
+    def _extract_bidask_levels(self, bidask: Any, side: str) -> list[dict[str, Any]]:
+        price_attr = f"{side}_price"
+        volume_attr = f"{side}_volume"
+
+        if isinstance(bidask, dict):
+            prices_raw = bidask.get(price_attr)
+            volumes_raw = bidask.get(volume_attr)
+        else:
+            prices_raw = getattr(bidask, price_attr, None)
+            volumes_raw = getattr(bidask, volume_attr, None)
+
+        if prices_raw is None:
+            return []
+
+        if not isinstance(prices_raw, (list, tuple)):
+            prices = [prices_raw]
+        else:
+            prices = list(prices_raw)
+
+        if volumes_raw is None:
+            volumes: list[Any] = []
+        elif isinstance(volumes_raw, (list, tuple)):
+            volumes = list(volumes_raw)
+        else:
+            volumes = [volumes_raw]
+
+        levels: list[dict[str, Any]] = []
+        for index, price in enumerate(prices):
+            if price is None:
+                continue
+            volume = volumes[index] if index < len(volumes) else None
+            if volume is None:
+                continue
+            try:
+                levels.append(
+                    {
+                        "level": index + 1,
+                        "price": round(float(price), 2),
+                        "volume": int(volume),
+                    }
+                )
+            except Exception:
+                continue
+
+        return levels
+
+    def _record_trade_tape(self, symbol: str, *, price: float, volume: int, ts_ms: int) -> None:
+        if not symbol or volume <= 0:
+            return
+        previous_price = self._last_trade_prices.get(symbol, price)
+        if price > previous_price:
+            side = "outer"
+        elif price < previous_price:
+            side = "inner"
+        else:
+            side = "neutral"
+        self._last_trade_prices[symbol] = price
+        timestamp = datetime.datetime.fromtimestamp(ts_ms / 1000, tz=_TZ_TW)
+        self._trade_tape_buffers.setdefault(symbol, deque(maxlen=20)).append(
+            {
+                "time": timestamp.strftime("%H:%M:%S"),
+                "price": round(price, 2),
+                "volume": int(volume // 1000 if volume >= 1000 else volume),
+                "side": side,
+            }
+        )
+
+    @staticmethod
+    def _price_step(price: float) -> float:
+        if price >= 1000:
+            return 1.0
+        if price >= 500:
+            return 0.5
+        if price >= 100:
+            return 0.1
+        return 0.05
 
 
 def _to_epoch_seconds(ts_raw: Any) -> int:
@@ -626,12 +927,40 @@ def _to_epoch_seconds(ts_raw: Any) -> int:
     return int(str(ts_raw))
 
 
+def _to_epoch_milliseconds(ts_raw: Any) -> int:
+    if hasattr(ts_raw, "timestamp"):
+        return int(ts_raw.timestamp() * 1_000)
+    if isinstance(ts_raw, (int, float)):
+        value = int(ts_raw)
+        abs_value = abs(value)
+        if abs_value >= 1_000_000_000_000_000_000:
+            return value // 1_000_000
+        if abs_value >= 1_000_000_000_000_000:
+            return value // 1_000
+        if abs_value >= 1_000_000_000_000:
+            return value
+        return value * 1_000
+    return _to_epoch_milliseconds(float(str(ts_raw)))
+
+
 def _bind_index_tick_handler(api: Any, callback: Any) -> bool:
     decorator_factory = getattr(api, "on_tick_idx_v1", None)
     if not callable(decorator_factory):
         return False
     decorator_factory()(callback)
     return True
+
+
+def _get_taiex_contract(api: Any) -> Any | None:
+    contracts = getattr(api, "Contracts", None)
+    indices = getattr(contracts, "Indices", None)
+    tse_indices = getattr(indices, "TSE", None)
+    if tse_indices is None:
+        return None
+    try:
+        return tse_indices[_TAIEX_SYMBOL]
+    except Exception:
+        return None
 
 
 def _safe_number(obj: Any, attrs: tuple[str, ...], default: float | None = None) -> float | None:
@@ -798,14 +1127,7 @@ def _normalise_tick(tick: Any, meta: dict[str, Any]) -> dict[str, Any] | None:
         volume = int(getattr(tick, "volume"))
         raw_ts = getattr(tick, "ts")
 
-        if isinstance(raw_ts, float) and raw_ts < 1e12:
-            ts_ms = int(raw_ts * 1_000)
-        elif raw_ts > 1_000_000_000_000_000:
-            ts_ms = int(raw_ts // 1_000_000)
-        elif raw_ts > 1_000_000_000_000:
-            ts_ms = int(raw_ts // 1_000)
-        else:
-            ts_ms = int(raw_ts * 1_000)
+        ts_ms = _to_epoch_milliseconds(raw_ts)
 
         total_volume = int(
             _safe_number(tick, ("total_volume", "total_vol", "acc_volume", "acc_vol", "volume_total"), default=None)
@@ -834,6 +1156,85 @@ def _normalise_tick(tick: Any, meta: dict[str, Any]) -> dict[str, Any] | None:
     except Exception as exc:
         logger.debug("Tick normalisation error: %s", exc)
         return None
+
+
+_NON_ORDINARY_STOCK_MARKERS = (
+    "ETF",
+    "ETN",
+    "WARRANT",
+    "權證",
+    "OPTION",
+    "OPTIONS",
+    "FUTURE",
+    "FUTURES",
+    "INDEX",
+    "指數",
+    "FUND",
+    "基金",
+    "REIT",
+    "ADR",
+    "GDR",
+    "TDR",
+    "DEPOSITARY",
+    "PREFERENCE",
+    "特別股",
+    "優先股",
+    "EMERGING",
+    "興櫃",
+    "CALL",
+    "PUT",
+    "BOND",
+    "債",
+    "債券",
+)
+
+
+def _iter_contract_collection(collection: Any) -> list[tuple[str, Any]]:
+    if collection is None:
+        return []
+
+    items = getattr(collection, "items", None)
+    if callable(items):
+        try:
+            return [
+                (str(symbol).strip(), contract)
+                for symbol, contract in items()
+                if str(symbol).strip()
+            ]
+        except Exception:
+            return []
+
+    try:
+        results: list[tuple[str, Any]] = []
+        for contract in collection:
+            symbol = str(getattr(contract, "code", "") or getattr(contract, "symbol", "") or "").strip()
+            if symbol:
+                results.append((symbol, contract))
+        return results
+    except TypeError:
+        return []
+
+
+def _is_ordinary_stock_contract(contract: Any) -> bool:
+    symbol = str(getattr(contract, "code", "") or getattr(contract, "symbol", "") or "").strip()
+    if not (len(symbol) == 4 and symbol.isdigit()):
+        return False
+    if symbol.startswith("00"):
+        return False
+
+    fields = [
+        str(getattr(contract, "type", "") or ""),
+        str(getattr(contract, "category", "") or ""),
+        str(getattr(contract, "name", "") or ""),
+    ]
+    text = " ".join(fields).upper()
+    return not any(marker in text for marker in _NON_ORDINARY_STOCK_MARKERS)
+
+
+def load_shioaji_stock_universe(api: Any) -> dict[str, dict[str, Any]]:
+    from quote_runtime.universe_loader import load_shioaji_stock_universe as _load_shioaji_stock_universe
+
+    return _load_shioaji_stock_universe(api)
 
 
 def collector_from_env(
