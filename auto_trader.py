@@ -182,6 +182,7 @@ class AutoTrader:
         # Pre-open watchlist: stocks with consecutive institutional buying
         self._preopen_watchlist: set[str] = set()
         self._swing_runtime = SwingRuntimeCoordinator()
+        self._retail_flow_non_entry_reasons: dict[str, str] = {}
 
         # Sector rotation: cached today's hot/cold sector flow + alert dedup
         self._sector_flows_today: dict[str, Any] = {}   # sector -> SectorFlowSnapshot
@@ -307,6 +308,7 @@ class AutoTrader:
             self._last_eod_report_date = None
             self._market_change_pct = 0.0
             self._swing_runtime.reset_for_new_day()
+            self._retail_flow_non_entry_reasons.clear()
             self._build_preopen_watchlist()
 
     async def _check_overnight_gap(self, symbol: str, open_price: float, ts_ms: int) -> None:
@@ -453,6 +455,26 @@ class AutoTrader:
 
     def _swing_trade_date(self) -> str:
         return self._current_date or datetime.datetime.now(tz=_TZ_TW).strftime("%Y-%m-%d")
+
+    def get_retail_flow_watch_state(self, symbol: str) -> str | None:
+        return self._swing_runtime.watch_states.get(symbol)
+
+    def get_retail_flow_last_non_entry_reason(self, symbol: str) -> str | None:
+        return self._retail_flow_non_entry_reasons.get(symbol)
+
+    def get_retail_flow_candidates(self) -> list[str]:
+        if self._institutional_flow_cache is None:
+            return []
+        return sorted(self._institutional_flow_cache.symbols_for_date(self._swing_trade_date()))
+
+    def get_retail_flow_watchlist(self) -> list[str]:
+        return sorted(self._preopen_watchlist)
+
+    def _set_retail_flow_non_entry_reason(self, symbol: str, reason: str) -> None:
+        self._retail_flow_non_entry_reasons[symbol] = reason
+
+    def _clear_retail_flow_non_entry_reason(self, symbol: str) -> None:
+        self._retail_flow_non_entry_reasons.pop(symbol, None)
 
     def _build_preopen_watchlist(self) -> None:
         """每日換日時建立今日籌碼確認標的清單，讓這些股票以較低門檻進場。"""
@@ -631,15 +653,18 @@ class AutoTrader:
         payload: dict[str, Any],
     ) -> None:
         if self._institutional_flow_cache is None or self._retail_flow_strategy is None:
+            self._set_retail_flow_non_entry_reason(symbol, "strategy_unavailable")
             return
 
         # 波段進場只在開盤後 60 分鐘內評估（09:00–10:00）
         # 籌碼資料是前一日的（T+1 延遲），應以昨日為基準在開盤時決策
         if not _is_swing_entry_window(ts_ms):
+            self._set_retail_flow_non_entry_reason(symbol, "outside_entry_window")
             return
 
         flow_row = self._institutional_flow_cache.get(self._swing_trade_date(), symbol)
         if flow_row is None:
+            self._set_retail_flow_non_entry_reason(symbol, "flow_row_missing")
             return
 
         flow_score = self._retail_flow_strategy.compute_flow_score(flow_row)
@@ -656,8 +681,10 @@ class AutoTrader:
             classifier=self._retail_flow_strategy.classify_watch_state,
         )
         if not self._retail_flow_strategy.should_enter_position(watch_state=watch_state):
+            self._set_retail_flow_non_entry_reason(symbol, f"watch_state_{watch_state}")
             return
         if not self._swing_runtime.should_trigger_entry(symbol, watch_state):
+            self._set_retail_flow_non_entry_reason(symbol, "duplicate_ready_state")
             return
 
         atr = self._daily_atr(symbol)
@@ -665,6 +692,7 @@ class AutoTrader:
         shares = self._risk.calc_position_shares(price, stop_price)
         allowed, _reason = self._risk.can_buy(symbol, price, shares, len(self._book.positions))
         if not allowed:
+            self._set_retail_flow_non_entry_reason(symbol, "risk_rejected")
             return
 
         target_price = self._risk.calc_target_price(price, stop_price)
@@ -680,6 +708,7 @@ class AutoTrader:
             shares=shares,
         )
         self._swing_runtime.mark_entered(symbol)
+        self._clear_retail_flow_non_entry_reason(symbol)
         logger.info(
             "SwingEntry %s @ %.2f shares=%d stop=%.2f target=%.2f atr=%.2f (籌碼為前日 T+1 資料)",
             symbol, price, shares, stop_price, target_price, atr or 0.0,
@@ -1880,6 +1909,12 @@ class AutoTrader:
         snapshot["winRate"] = round(win_rate, 1)
         snapshot["marketChangePct"] = round(self._market_change_pct, 2)
         snapshot["riskStatus"] = self._risk.status_dict()
+        snapshot["retailFlow"] = {
+            "watchStates": dict(self._swing_runtime.watch_states),
+            "lastNonEntryReasons": dict(self._retail_flow_non_entry_reasons),
+            "candidates": self.get_retail_flow_candidates(),
+            "watchlist": self.get_retail_flow_watchlist(),
+        }
         return snapshot
 
     async def execute_manual_trade(
