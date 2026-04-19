@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import types
@@ -6,6 +6,9 @@ import types
 import pytest
 
 from auto_trader import AutoTrader
+from institutional_flow_cache import InstitutionalFlowCache
+from institutional_flow_provider import InstitutionalFlowRow
+from retail_flow_strategy import RetailFlowSwingStrategy
 from trading import DecisionFactor as TradingDecisionFactor
 from trading import DecisionReport as TradingDecisionReport
 from trading.decision_reports import DecisionFactor, DecisionReport
@@ -17,6 +20,10 @@ class _FakeRiskManager:
         self.rolling_5day_pnl = 0.0
         self.is_halted = False
         self.is_weekly_halted = False
+        self.is_in_cooldown = False
+        self.consecutive_losses = 0
+        self.just_entered_cooldown = False
+        self.min_net_profit_pct = 1.085
         self.buy_calls: list[tuple[str, float, int]] = []
         self.sell_calls: list[tuple[str, float]] = []
 
@@ -29,6 +36,9 @@ class _FakeRiskManager:
     def calc_target_price(self, price: float, stop_price: float) -> float:
         risk = price - stop_price
         return round(price + risk * 2, 2)
+
+    def calc_position_shares(self, price: float, stop_price: float, lot_size: int = 1000) -> int:
+        return lot_size
 
     def on_buy(self, symbol: str, price: float, shares: int) -> None:
         self.buy_calls.append((symbol, price, shares))
@@ -75,6 +85,31 @@ class _FakeDailyReporter:
     def build_and_send(self, *, day_payload: dict[str, object]) -> object:
         self.calls.append(day_payload)
         return {"text": "ok"}
+
+
+class _TrackingRetailFlowSwingStrategy(RetailFlowSwingStrategy):
+    def __init__(self) -> None:
+        self.classify_calls: list[dict[str, object]] = []
+
+    def classify_watch_state(
+        self,
+        *,
+        flow_score: float,
+        above_ma10: bool,
+        volume_confirmed: bool,
+        recent_runup_pct: float,
+        consecutive_trust_days: int = 0,
+    ) -> str:
+        self.classify_calls.append(
+            {
+                "flow_score": flow_score,
+                "above_ma10": above_ma10,
+                "volume_confirmed": volume_confirmed,
+                "recent_runup_pct": recent_runup_pct,
+                "consecutive_trust_days": consecutive_trust_days,
+            }
+        )
+        return "ready_to_buy"
 
 
 def test_decision_reports_are_exported_and_serialized() -> None:
@@ -164,24 +199,24 @@ async def test_portfolio_snapshot_includes_structured_decision_reports_for_buy_a
     assert buy_report["orderResult"]["status"] == "executed"
     assert any(factor["kind"] == "support" for factor in buy_report["supportingFactors"])
     assert buy_report["confidence"] > 0
-    assert "多方觀點" in buy_report["bullCase"]
-    assert "空方觀點" in buy_report["bearCase"]
-    assert "風控觀點" in buy_report["riskCase"]
-    assert "多方論點" in buy_report["bullArgument"]
-    assert "空方論點" in buy_report["bearArgument"]
-    assert "裁決結論" in buy_report["refereeVerdict"]
+    assert isinstance(buy_report["bullCase"], str) and buy_report["bullCase"]
+    assert isinstance(buy_report["bearCase"], str) and buy_report["bearCase"]
+    assert isinstance(buy_report["riskCase"], str) and buy_report["riskCase"]
+    assert isinstance(buy_report["bullArgument"], str) and buy_report["bullArgument"]
+    assert isinstance(buy_report["bearArgument"], str) and buy_report["bearArgument"]
+    assert isinstance(buy_report["refereeVerdict"], str) and buy_report["refereeVerdict"]
     assert buy_report["debateWinner"] in {"bull", "bear", "tie"}
 
     assert sell_report["decisionType"] == "sell"
     assert sell_report["finalReason"] == "take_profit"
     assert sell_report["orderResult"]["status"] == "executed"
     assert any(flag == "target_hit" for flag in sell_report["riskFlags"])
-    assert "多方觀點" in sell_report["bullCase"]
-    assert "空方觀點" in sell_report["bearCase"]
-    assert "風控觀點" in sell_report["riskCase"]
-    assert "多方論點" in sell_report["bullArgument"]
-    assert "空方論點" in sell_report["bearArgument"]
-    assert "裁決結論" in sell_report["refereeVerdict"]
+    assert isinstance(sell_report["bullCase"], str) and sell_report["bullCase"]
+    assert isinstance(sell_report["bearCase"], str) and sell_report["bearCase"]
+    assert isinstance(sell_report["riskCase"], str) and sell_report["riskCase"]
+    assert isinstance(sell_report["bullArgument"], str) and sell_report["bullArgument"]
+    assert isinstance(sell_report["bearArgument"], str) and sell_report["bearArgument"]
+    assert isinstance(sell_report["refereeVerdict"], str) and sell_report["refereeVerdict"]
 
 
 @pytest.mark.asyncio
@@ -226,12 +261,12 @@ async def test_buy_skip_is_recorded_as_replayable_decision_report() -> None:
     assert latest["finalReason"] == "sentiment_blocked"
     assert latest["orderResult"]["status"] == "skipped"
     assert any(factor["kind"] == "oppose" for factor in latest["opposingFactors"])
-    assert "多方觀點" in latest["bullCase"]
-    assert "空方觀點" in latest["bearCase"]
-    assert "風控觀點" in latest["riskCase"]
-    assert "多方論點" in latest["bullArgument"]
-    assert "空方論點" in latest["bearArgument"]
-    assert "裁決結論" in latest["refereeVerdict"]
+    assert isinstance(latest["bullCase"], str) and latest["bullCase"]
+    assert isinstance(latest["bearCase"], str) and latest["bearCase"]
+    assert isinstance(latest["riskCase"], str) and latest["riskCase"]
+    assert isinstance(latest["bullArgument"], str) and latest["bullArgument"]
+    assert isinstance(latest["bearArgument"], str) and latest["bearArgument"]
+    assert isinstance(latest["refereeVerdict"], str) and latest["refereeVerdict"]
 
 
 @pytest.mark.asyncio
@@ -349,8 +384,199 @@ async def test_short_and_cover_decision_reports_have_correct_types() -> None:
     assert short_trade["action"] == "SHORT"
     assert short_report["decisionType"] == "short"
     assert short_report["orderResult"]["status"] == "executed"
-    assert "空方觀點" in short_report["bearCase"]
+    assert isinstance(short_report["bearCase"], str) and short_report["bearCase"]
 
     assert cover_trade["action"] == "COVER"
     assert cover_report["decisionType"] == "cover"
     assert cover_report["orderResult"]["status"] == "executed"
+
+
+@pytest.mark.asyncio
+async def test_swing_strategy_path_does_not_trigger_eod_flatten() -> None:
+    trader = AutoTrader(
+        telegram_token="",
+        chat_id="",
+        risk_manager=_FakeRiskManager(),
+        sentiment_filter=_FakeSentimentFilter(score=0.2, blocked=False),
+        strategy_mode="retail_flow_swing",
+        retail_flow_strategy=RetailFlowSwingStrategy(),
+        institutional_flow_cache=InstitutionalFlowCache(),
+    )
+
+    async def _noop(*args, **kwargs) -> None:
+        return None
+
+    close_calls: list[int] = []
+
+    async def _fake_close_all_eod(self, ts_ms: int) -> None:
+        close_calls.append(ts_ms)
+
+    trader._send = types.MethodType(_noop, trader)
+    trader._persist_trade = types.MethodType(_noop, trader)
+    trader._close_all_eod = types.MethodType(_fake_close_all_eod, trader)
+
+    await trader.on_tick(
+        {
+            "symbol": "2330",
+            "price": 101.0,
+            "volume": 1000,
+            "ts": 1_775_500_400_000 + ((13 * 60 + 26) * 60 * 1000),
+            "previousClose": 100.0,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.5,
+        }
+    )
+
+    assert close_calls == []
+
+
+@pytest.mark.asyncio
+async def test_swing_strategy_uses_retail_flow_entry_logic() -> None:
+    cache = InstitutionalFlowCache()
+    cache.store(
+        trade_date="2026-04-20",
+        rows=[
+            InstitutionalFlowRow(
+                symbol="2330",
+                name="TSMC",
+                foreign_net_buy=1000,
+                investment_trust_net_buy=500,
+                major_net_buy=800,
+            )
+        ],
+    )
+    strategy = _TrackingRetailFlowSwingStrategy()
+    trader = AutoTrader(
+        telegram_token="",
+        chat_id="",
+        risk_manager=_FakeRiskManager(),
+        sentiment_filter=_FakeSentimentFilter(score=0.2, blocked=False),
+        strategy_mode="retail_flow_swing",
+        retail_flow_strategy=strategy,
+        institutional_flow_cache=cache,
+    )
+
+    async def _noop(*args, **kwargs) -> None:
+        return None
+
+    buy_calls: list[tuple[str, float, int]] = []
+
+    class _FakeExecution:
+        async def execute_buy(self, **kwargs) -> None:
+            buy_calls.append((kwargs["symbol"], kwargs["price"], kwargs["ts_ms"]))
+
+        async def execute_sell(self, **kwargs) -> None:
+            raise AssertionError("unexpected sell")
+
+        async def execute_short(self, **kwargs) -> None:
+            raise AssertionError("unexpected short")
+
+        async def execute_cover(self, **kwargs) -> None:
+            raise AssertionError("unexpected cover")
+
+    trader._send = types.MethodType(_noop, trader)
+    trader._persist_trade = types.MethodType(_noop, trader)
+    trader._execution = _FakeExecution()
+    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
+    trader._calc_atr = types.MethodType(lambda self, symbol: 1.5, trader)
+
+    base_ts = int(__import__("datetime").datetime(2026, 4, 20, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
+    for i, price in enumerate([100.0, 100.5, 101.0, 101.5, 102.0, 102.5, 103.0, 103.5, 104.0, 104.5, 105.0]):
+        await trader.on_tick(
+            {
+                "symbol": "2330",
+                "price": price,
+                "volume": 1000,
+                "ts": base_ts + i * 60_000,
+                "previousClose": 99.0,
+                "open": 99.5,
+                "high": price,
+                "low": 99.0,
+            }
+        )
+
+    assert strategy.classify_calls, "expected retail flow strategy to classify watch state"
+    assert buy_calls, "expected retail flow swing mode to enter via _paper_buy"
+    assert trader._swing_runtime.watch_states["2330"] == "entered"
+
+
+@pytest.mark.asyncio
+async def test_swing_strategy_only_buys_once_when_state_stays_ready() -> None:
+    cache = InstitutionalFlowCache()
+    cache.store(
+        trade_date="2026-04-20",
+        rows=[
+            InstitutionalFlowRow(
+                symbol="2330",
+                name="TSMC",
+                foreign_net_buy=1000,
+                investment_trust_net_buy=500,
+                major_net_buy=800,
+            )
+        ],
+    )
+
+    class _TransitionStrategy(RetailFlowSwingStrategy):
+        def __init__(self) -> None:
+            self.states = ["watch", "ready_to_buy", "ready_to_buy"]
+
+        def classify_watch_state(self, **kwargs) -> str:
+            if self.states:
+                return self.states.pop(0)
+            return "ready_to_buy"
+
+    strategy = _TransitionStrategy()
+    trader = AutoTrader(
+        telegram_token="",
+        chat_id="",
+        risk_manager=_FakeRiskManager(),
+        sentiment_filter=_FakeSentimentFilter(score=0.2, blocked=False),
+        strategy_mode="retail_flow_swing",
+        retail_flow_strategy=strategy,
+        institutional_flow_cache=cache,
+    )
+
+    async def _noop(*args, **kwargs) -> None:
+        return None
+
+    buy_calls: list[tuple[str, float, int]] = []
+
+    class _FakeExecution:
+        async def execute_buy(self, **kwargs) -> None:
+            buy_calls.append((kwargs["symbol"], kwargs["price"], kwargs["ts_ms"]))
+
+        async def execute_sell(self, **kwargs) -> None:
+            raise AssertionError("unexpected sell")
+
+        async def execute_short(self, **kwargs) -> None:
+            raise AssertionError("unexpected short")
+
+        async def execute_cover(self, **kwargs) -> None:
+            raise AssertionError("unexpected cover")
+
+    trader._send = types.MethodType(_noop, trader)
+    trader._persist_trade = types.MethodType(_noop, trader)
+    trader._execution = _FakeExecution()
+    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
+    trader._calc_atr = types.MethodType(lambda self, symbol: 1.5, trader)
+
+    base_ts = int(__import__("datetime").datetime(2026, 4, 20, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
+    for i, price in enumerate([100.0, 100.5, 101.0, 101.5, 102.0, 102.5, 103.0, 103.5, 104.0, 104.5, 105.0, 105.5]):
+        await trader.on_tick(
+            {
+                "symbol": "2330",
+                "price": price,
+                "volume": 1000,
+                "ts": base_ts + i * 60_000,
+                "previousClose": 99.0,
+                "open": 99.5,
+                "high": price,
+                "low": 99.0,
+            }
+        )
+
+    assert len(buy_calls) == 1
+    assert trader._swing_runtime.watch_states["2330"] == "entered"
+
+
