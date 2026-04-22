@@ -17,6 +17,7 @@ class PaperPosition:
     entry_atr: float | None = None
     peak_price: float = 0.0
     trail_stop_price: float = 0.0
+    partial_exit_done: bool = False
 
 
 @dataclass

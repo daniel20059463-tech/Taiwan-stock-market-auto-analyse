@@ -567,6 +567,14 @@ def _prime_daily_price_cache(symbols: list[str]) -> Any:
         cache.load(DAILY_PRICE_CACHE_PATH)
 
         symbols_to_backfill = [s for s in symbols if not cache.has_enough_data(s, DAILY_PRICE_MIN_BARS)]
+        should_backfill_on_startup = _env_flag("DAILY_PRICE_BACKFILL_ON_STARTUP", "false")
+        if symbols_to_backfill and not should_backfill_on_startup:
+            logger.info(
+                "Skipping startup daily price backfill for %d symbols; using existing cache only",
+                len(symbols_to_backfill),
+            )
+            return cache
+
         if symbols_to_backfill:
             try:
                 fetcher_module = importlib.import_module("historical_data")

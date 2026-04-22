@@ -34,6 +34,7 @@ def _make_base_context(**overrides) -> AnalystContext:
 class _FakeRiskManager:
     def __init__(self, daily_pnl: float = 0.0) -> None:
         self._daily_pnl = daily_pnl
+        self.min_net_profit_pct = 1.085
 
     @property
     def daily_pnl(self) -> float:
@@ -47,6 +48,9 @@ class _FakeRiskManager:
 
     def calc_target_price(self, price, stop_price):
         return round(price + (price - stop_price) * 2, 2)
+
+    def calc_position_shares(self, price, stop_price, lot_size=1000):
+        return lot_size
 
     def on_buy(self, symbol, price, shares):
         pass

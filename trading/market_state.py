@@ -127,3 +127,30 @@ class MarketState:
             return None
 
         return round(sum(true_ranges) / len(true_ranges), 4)
+
+    def calculate_rsi(self, symbol: str, period: int = 14) -> Optional[float]:
+        """Calculate simple RSI from recent 1-minute bar closing prices."""
+        history = self._bar_history.get(symbol)
+        if history is None or len(history) < period + 1:
+            return None
+
+        closes = [bar.close for bar in list(history)[-(period + 1):]]
+        gains: list[float] = []
+        losses: list[float] = []
+        for i in range(1, len(closes)):
+            change = closes[i] - closes[i - 1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(abs(change))
+
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+
+        if avg_loss == 0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+        return round(100.0 - (100.0 / (1 + rs)), 2)

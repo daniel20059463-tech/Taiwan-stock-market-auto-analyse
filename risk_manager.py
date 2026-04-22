@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -20,14 +21,20 @@ ATR_MULTIPLIER = 2.0
 MIN_STOP_PCT = 1.5
 MAX_STOP_PCT = 6.0
 RISK_REWARD_RATIO = 2.0
+RISK_PCT_PER_TRADE = 1.0   # 每筆最大風險：帳戶資金的 1%
 
 TX_FEE_BUY_PCT = 0.1425
 TX_FEE_SELL_PCT = 0.1425
 TX_TAX_SELL_PCT = 0.3000
 TX_TOTAL_RT_PCT = TX_FEE_BUY_PCT + TX_FEE_SELL_PCT + TX_TAX_SELL_PCT
+MIN_NET_PROFIT_PCT = TX_TOTAL_RT_PCT + 0.5  # 來回成本 + 0.5% 安全邊際
 
 ROLLING_5DAY_LOSS_PCT = 5.0
 MAX_GLOBAL_DRAWDOWN_PCT = 15.0
+
+
+CONSECUTIVE_LOSS_LIMIT = 3
+COOLDOWN_SECONDS = 3600  # 連續虧損後冷卻 1 小時
 
 
 @dataclass
@@ -37,6 +44,8 @@ class RiskState:
     current_date: str = ""
     daily_pnl_history: list = field(default_factory=list)
     peak_equity: float | None = None
+    consecutive_losses: int = 0
+    cooldown_until_ts: float = 0.0
 
 
 class RiskManager:
@@ -54,6 +63,7 @@ class RiskManager:
         max_stop_pct: float = MAX_STOP_PCT,
         risk_reward_ratio: float = RISK_REWARD_RATIO,
         rolling_5day_loss_pct: float = ROLLING_5DAY_LOSS_PCT,
+        min_net_profit_pct: float = MIN_NET_PROFIT_PCT,
     ) -> None:
         self.account_capital = account_capital
         self.max_daily_loss = account_capital * max_daily_loss_pct / 100
@@ -64,10 +74,13 @@ class RiskManager:
         self.min_stop_pct = min_stop_pct
         self.max_stop_pct = max_stop_pct
         self.risk_reward_ratio = risk_reward_ratio
+        self.min_net_profit_pct = min_net_profit_pct
         self.max_global_drawdown_pct = MAX_GLOBAL_DRAWDOWN_PCT
+        self.risk_pct_per_trade = RISK_PCT_PER_TRADE
 
         self._state = RiskState()
         self._state.peak_equity = account_capital
+        self._just_entered_cooldown: bool = False
 
     def _check_date_reset(self) -> None:
         """Roll daily counters and keep a 5-day realized PnL window."""
@@ -118,6 +131,10 @@ class RiskManager:
                 f"已超過 {self.max_global_drawdown_pct:.1f}% 上限，停止開倉。"
             )
 
+        if time.time() < self._state.cooldown_until_ts:
+            remaining_min = int((self._state.cooldown_until_ts - time.time()) / 60) + 1
+            return False, f"連續虧損冷卻中，約 {remaining_min} 分鐘後恢復交易。"
+
         if current_positions >= self.max_positions:
             return False, f"持倉檔數已達上限 {self.max_positions}。"
 
@@ -148,6 +165,35 @@ class RiskManager:
         )
         return round(stop_price, 2)
 
+    def calc_position_shares(
+        self,
+        entry_price: float,
+        stop_price: float,
+        lot_size: int = 1000,
+    ) -> int:
+        """
+        以「每筆最大風險金額」反推持倉張數。
+
+        risk_amount = account_capital × risk_pct_per_trade%
+        shares_raw  = risk_amount / (entry_price - stop_price)
+
+        結果：
+        - 向下取整到最近的 lot_size 倍數
+        - 下限 1 張，上限受 max_single_position 約束
+        """
+        risk_per_share = entry_price - stop_price
+        if risk_per_share <= 0:
+            return lot_size
+
+        risk_amount = self.account_capital * self.risk_pct_per_trade / 100
+        shares_raw = risk_amount / risk_per_share
+        shares = max(lot_size, int(shares_raw // lot_size) * lot_size)
+
+        max_shares_by_capital = int(self.max_single_position / entry_price // lot_size) * lot_size
+        shares = min(shares, max(lot_size, max_shares_by_capital))
+
+        return shares
+
     def calc_target_price(self, entry_price: float, stop_price: float) -> float:
         """Calculate a reward target using the configured risk/reward ratio."""
         risk = entry_price - stop_price
@@ -162,6 +208,19 @@ class RiskManager:
     def on_sell(self, symbol: str, pnl: float) -> None:
         self._check_date_reset()
         self._state.daily_realized_pnl += pnl
+
+        if pnl < 0:
+            self._state.consecutive_losses += 1
+            if self._state.consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+                self._state.cooldown_until_ts = time.time() + COOLDOWN_SECONDS
+                self._just_entered_cooldown = True
+                logger.warning(
+                    "RiskManager: %d consecutive losses, entering %d-second cooldown",
+                    self._state.consecutive_losses,
+                    COOLDOWN_SECONDS,
+                )
+        else:
+            self._state.consecutive_losses = 0
 
         current_eq = (
             self.account_capital
@@ -205,6 +264,22 @@ class RiskManager:
         return self.rolling_5day_pnl <= -self.max_rolling_loss
 
     @property
+    def is_in_cooldown(self) -> bool:
+        return time.time() < self._state.cooldown_until_ts
+
+    @property
+    def consecutive_losses(self) -> int:
+        return self._state.consecutive_losses
+
+    @property
+    def just_entered_cooldown(self) -> bool:
+        """Returns True once after cooldown is triggered, then resets."""
+        if self._just_entered_cooldown:
+            self._just_entered_cooldown = False
+            return True
+        return False
+
+    @property
     def is_halted(self) -> bool:
         self._check_date_reset()
         return self._state.daily_realized_pnl <= -self.max_daily_loss
@@ -246,6 +321,8 @@ class RiskManager:
             "maxPositions": self.max_positions,
             "maxSinglePosition": round(self.max_single_position, 0),
             "txCostRoundtripPct": TX_TOTAL_RT_PCT,
+            "isInCooldown": self.is_in_cooldown,
+            "consecutiveLosses": self._state.consecutive_losses,
         }
 
 

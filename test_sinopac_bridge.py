@@ -391,6 +391,7 @@ def test_history_bars_sync_reconnects_and_retries_once_after_kbars_failure() -> 
         ),
     )
     collector._api = first_api
+    collector._build_fallback_history_bars = lambda symbol, months=6: []  # type: ignore[method-assign]
 
     reconnect_calls = {"count": 0}
 
@@ -408,7 +409,17 @@ def test_history_bars_sync_reconnects_and_retries_once_after_kbars_failure() -> 
     assert candles[1]["close"] == 102.0
 
 
-def test_session_bars_sync_reconnects_and_retries_once_after_kbars_failure() -> None:
+def test_session_bars_sync_reconnects_and_retries_once_after_kbars_failure(monkeypatch) -> None:
+    import datetime as _dt
+    _TZ_TW = _dt.timezone(_dt.timedelta(hours=8))
+    _market_open_time = _dt.datetime(2026, 4, 21, 10, 0, tzinfo=_TZ_TW)
+    monkeypatch.setattr("sinopac_bridge.datetime.datetime", type("_MockDt", (), {
+        "now": staticmethod(lambda tz=None: _market_open_time),
+        "fromtimestamp": staticmethod(_dt.datetime.fromtimestamp),
+        "today": staticmethod(_dt.datetime.today),
+        "strptime": staticmethod(_dt.datetime.strptime),
+    }))
+
     collector = SinopacCollector(
         ["2330"],
         api_key="demo",
@@ -486,6 +497,7 @@ def test_history_bars_sync_waits_and_reconnects_again_after_503_relogin_cooldown
 
     monkeypatch.setattr("sinopac_bridge.time.sleep", lambda seconds: sleep_calls.append(seconds))
     collector._reconnect_sync = reconnect  # type: ignore[method-assign]
+    collector._build_fallback_history_bars = lambda symbol, months=6: []  # type: ignore[method-assign]
 
     candles = collector._history_bars_sync("2330", months=1)
 

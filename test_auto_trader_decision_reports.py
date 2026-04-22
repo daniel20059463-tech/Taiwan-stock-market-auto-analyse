@@ -481,7 +481,7 @@ async def test_swing_strategy_uses_retail_flow_entry_logic() -> None:
     trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
     trader._calc_atr = types.MethodType(lambda self, symbol: 1.5, trader)
 
-    base_ts = int(__import__("datetime").datetime(2026, 4, 20, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
+    base_ts = int(__import__("datetime").datetime(2026, 4, 21, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
     for i, price in enumerate([100.0, 100.5, 101.0, 101.5, 102.0, 102.5, 103.0, 103.5, 104.0, 104.5, 105.0]):
         await trader.on_tick(
             {
@@ -561,7 +561,7 @@ async def test_swing_strategy_only_buys_once_when_state_stays_ready() -> None:
     trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
     trader._calc_atr = types.MethodType(lambda self, symbol: 1.5, trader)
 
-    base_ts = int(__import__("datetime").datetime(2026, 4, 20, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
+    base_ts = int(__import__("datetime").datetime(2026, 4, 21, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
     for i, price in enumerate([100.0, 100.5, 101.0, 101.5, 102.0, 102.5, 103.0, 103.5, 104.0, 104.5, 105.0, 105.5]):
         await trader.on_tick(
             {

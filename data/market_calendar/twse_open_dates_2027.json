@@ -1,0 +1,6 @@
+{
+  "exchange": "TWSE",
+  "timezone": "Asia/Taipei",
+  "source_note": "Placeholder for confirmed TWSE 2027 open trading dates. Until the official calendar is loaded, open_dates remains empty and runtime stays fail-closed.",
+  "open_dates": []
+}

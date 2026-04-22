@@ -158,7 +158,7 @@ def test_retail_flow_observability_exports_candidates_and_watchlist() -> None:
         retail_flow_strategy=RetailFlowSwingStrategy(),
         institutional_flow_cache=cache,
     )
-    trader._current_date = "2026-04-20"
+    trader._current_date = "2026-04-21"
 
     trader._build_preopen_watchlist()
 
@@ -176,7 +176,7 @@ def test_portfolio_snapshot_includes_retail_flow_observability_block() -> None:
         retail_flow_strategy=RetailFlowSwingStrategy(),
         institutional_flow_cache=cache,
     )
-    trader._current_date = "2026-04-20"
+    trader._current_date = "2026-04-21"
     trader._swing_runtime.watch_states["2330"] = "ready_to_buy"
     trader._build_preopen_watchlist()
     trader._retail_flow_non_entry_reasons["2330"] = "duplicate_ready_state"

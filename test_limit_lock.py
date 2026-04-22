@@ -17,6 +17,7 @@ class _FakeRiskManager:
         self.rolling_5day_pnl = 0.0
         self.is_halted = False
         self.is_weekly_halted = False
+        self.min_net_profit_pct = 1.085
 
     def can_buy(self, symbol: str, price: float, shares: int, current_positions: int) -> tuple[bool, str]:
         return True, "OK"
@@ -27,6 +28,9 @@ class _FakeRiskManager:
     def calc_target_price(self, price: float, stop_price: float) -> float:
         risk = price - stop_price
         return round(price + risk * 2, 2)
+
+    def calc_position_shares(self, price: float, stop_price: float, lot_size: int = 1000) -> int:
+        return lot_size
 
     def on_buy(self, symbol: str, price: float, shares: int) -> None:
         pass

@@ -5,6 +5,7 @@ from collections import deque
 import datetime
 import json
 import logging
+import multiprocessing
 import os
 import threading
 import time
@@ -23,6 +24,7 @@ from quote_runtime import (
 )
 
 logger = logging.getLogger(__name__)
+_DAILY_PRICE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "daily_price_cache.json")
 
 # ?? ?啗鈭斗??挾撣豢 ??????????????????????????????????????????????????????????
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
@@ -31,6 +33,52 @@ _MARKET_CLOSE_MIN = 13 * 60 + 30  # 13:30
 _LIMIT_UP_PCT = 9.5
 _LIMIT_DOWN_PCT = -9.5
 _TAIEX_SYMBOL = "TSE001"          # 加權指數在 shioaji 的合約代號
+_LOGIN_RETRY_DELAYS = (5.0, 15.0, 65.0)
+
+
+def _preload_history_cache_worker(symbols: list[str], months: int, cache_path: str) -> None:
+    try:
+        worker_logger = logging.getLogger(__name__)
+        worker_logger.info("History preload worker started symbols=%d months=%d", len(symbols), months)
+        fetcher_module = __import__("historical_data")
+        cache_module = __import__("daily_price_cache")
+        fetcher = fetcher_module.TWSEHistoricalFetcher()
+        cache = cache_module.DailyPriceCache()
+        cache.load(cache_path)
+        end_date = datetime.date.today()
+        start_date = (
+            end_date.replace(day=1) - datetime.timedelta(days=max(32, months * 32))
+        ).strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+        for symbol in symbols:
+            try:
+                fetched = fetcher.fetch_bars(symbol, start_date, end_str)
+                worker_logger.info("History preload fetched %s bars=%d", symbol, len(fetched))
+                for bar in fetched:
+                    trade_date = datetime.datetime.fromtimestamp(
+                        bar.ts_ms / 1000,
+                        tz=_TZ_TW,
+                    ).strftime("%Y-%m-%d")
+                    cache.add_bar(
+                        symbol,
+                        cache_module.DailyBar(
+                            date=trade_date,
+                            open=float(bar.open),
+                            high=float(bar.high),
+                            low=float(bar.low),
+                            close=float(bar.close),
+                            volume=int(bar.volume),
+                        ),
+                    )
+            except Exception:
+                worker_logger.warning("History preload fetch failed for %s", symbol)
+                continue
+        cache.prune()
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        cache.save(cache_path)
+        worker_logger.info("History preload worker saved cache path=%s", cache_path)
+    except Exception:
+        return
 
 class SinopacCollector:
     def __init__(
@@ -77,6 +125,8 @@ class SinopacCollector:
         self._taiex_prev_close: float = 0.0   # 加權指數前收（用於計算漲跌幅）
         self._last_tick_monotonic: float = 0.0
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._history_preload_processes: list[multiprocessing.Process] = []
+        self._history_preload_inflight: set[str] = set()
         self._reconnecting: bool = False
         self._native_order_books = NativeOrderBookBuffers(timezone=_TZ_TW)
         self._native_trade_tapes = NativeTradeTapeBuffers(
@@ -152,6 +202,10 @@ class SinopacCollector:
         self._accepting = False
         if self._sentiment_consumer is not None:
             await self._sentiment_consumer.stop()
+        for process in list(self._history_preload_processes):
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
         for task in (self._broadcast_task, self._watchdog_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -249,7 +303,7 @@ class SinopacCollector:
         from shioaji.constant import QuoteType, QuoteVersion
 
         api = sj.Shioaji(simulation=self._simulation)
-        api.login(api_key=self._api_key, secret_key=self._secret_key)
+        self._login_with_retry_sync(api)
         self._api = api
         loop = self._loop
         today = datetime.date.today().strftime("%Y-%m-%d")
@@ -350,6 +404,33 @@ class SinopacCollector:
 
         if taiex_contract is not None and not _bind_index_tick_handler(api, _on_idx_tick):
             logger.warning("TAIEX index tick hook unavailable in this Shioaji version; market filter disabled")
+
+    def _login_with_retry_sync(self, api: Any) -> None:
+        last_exc: Exception | None = None
+        attempts = len(_LOGIN_RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                api.login(api_key=self._api_key, secret_key=self._secret_key)
+                if attempt > 1:
+                    logger.info("Shioaji login recovered on attempt %d/%d", attempt, attempts)
+                return
+            except Exception as exc:
+                last_exc = exc
+                detail = str(exc)
+                if "StatusCode: 503" not in detail or "請1分鐘後再重新登入" not in detail:
+                    raise
+                if attempt >= attempts:
+                    break
+                delay = _LOGIN_RETRY_DELAYS[attempt - 1]
+                logger.warning(
+                    "Shioaji login cooldown on attempt %d/%d; retrying in %.0f seconds",
+                    attempt,
+                    attempts,
+                    delay,
+                )
+                time.sleep(delay)
+        if last_exc is not None:
+            raise last_exc
 
     def _load_symbol_meta_sync(self, contract: Any) -> dict[str, Any]:
         symbol = str(getattr(contract, "code", ""))
@@ -476,22 +557,27 @@ class SinopacCollector:
             self._offer_tick_threadsafe(payload)
 
     def _session_bars_sync(self, symbol: str, limit: int = 240) -> list[dict[str, Any]]:
+        now_tw = datetime.datetime.now(tz=_TZ_TW)
+        current_minute = now_tw.hour * 60 + now_tw.minute
+        if current_minute < _MARKET_OPEN_MIN or current_minute > _MARKET_CLOSE_MIN:
+            return self._build_fallback_session_bars(symbol, limit)
+
         if self._api is None:
-            return []
+            return self._build_fallback_session_bars(symbol, limit)
 
         contract = self._get_contract_sync(symbol)
         if contract is None:
-            return []
+            return self._build_fallback_session_bars(symbol, limit)
 
         today = datetime.date.today().strftime("%Y-%m-%d")
         try:
             kbars = self._load_kbars_with_retry_sync(symbol, contract, start=today, end=today, context="session")
         except Exception as exc:
             logger.warning("session kbars failed for %s: %s", symbol, exc)
-            return []
+            return self._build_fallback_session_bars(symbol, limit)
 
         if kbars is None or not hasattr(kbars, "ts") or len(kbars.ts) == 0:
-            return []
+            return self._build_fallback_session_bars(symbol, limit)
 
         bars: list[dict[str, Any]] = []
         start_index = max(0, len(kbars.ts) - max(1, limit))
@@ -509,6 +595,10 @@ class SinopacCollector:
         return bars
 
     def _history_bars_sync(self, symbol: str, months: int = 6) -> list[dict[str, Any]]:
+        cached_or_official = self._build_fallback_history_bars(symbol, months)
+        if cached_or_official:
+            return cached_or_official
+
         if self._api is None:
             return []
 
@@ -557,6 +647,112 @@ class SinopacCollector:
             candle["volume"] = int(candle["volume"]) + volume
 
         return [daily[key] for key in sorted(daily.keys())][-max(1, months * 31) :]
+
+    def _build_fallback_session_bars(self, symbol: str, limit: int = 240) -> list[dict[str, Any]]:
+        return []
+
+    def _build_fallback_history_bars(self, symbol: str, months: int = 6) -> list[dict[str, Any]]:
+        cache_bars = self._load_daily_cache_history_bars(symbol, months)
+        if cache_bars:
+            return cache_bars
+
+        try:
+            fetcher_module = __import__("historical_data")
+            fetcher = fetcher_module.TWSEHistoricalFetcher()
+            end_date = datetime.date.today()
+            start_date = (
+                end_date.replace(day=1) - datetime.timedelta(days=max(32, months * 32))
+            ).strftime("%Y-%m-%d")
+            end_str = end_date.strftime("%Y-%m-%d")
+            fetched = fetcher.fetch_bars(symbol, start_date, end_str)
+            if fetched:
+                self._persist_daily_cache_history_bars(symbol, fetched)
+                return [
+                    {
+                        "time": int((bar.ts_ms // 86_400_000) * 86_400_000 + 17 * 60 * 60 * 1000),
+                        "open": round(float(bar.open), 2),
+                        "high": round(float(bar.high), 2),
+                        "low": round(float(bar.low), 2),
+                        "close": round(float(bar.close), 2),
+                        "volume": int(bar.volume),
+                    }
+                    for bar in fetched[-max(1, months * 31) :]
+                ]
+        except Exception as exc:
+            logger.warning("fallback history fetch failed for %s: %s", symbol, exc)
+
+        return []
+
+    def _persist_daily_cache_history_bars(self, symbol: str, bars: list[Any]) -> None:
+        try:
+            cache_module = __import__("daily_price_cache")
+            cache = cache_module.DailyPriceCache()
+            cache.load(_DAILY_PRICE_CACHE_PATH)
+            for bar in bars:
+                trade_date = datetime.datetime.fromtimestamp(
+                    bar.ts_ms / 1000,
+                    tz=_TZ_TW,
+                ).strftime("%Y-%m-%d")
+                cache.add_bar(
+                    symbol,
+                    cache_module.DailyBar(
+                        date=trade_date,
+                        open=float(bar.open),
+                        high=float(bar.high),
+                        low=float(bar.low),
+                        close=float(bar.close),
+                        volume=int(bar.volume),
+                    ),
+                )
+            cache.prune()
+            os.makedirs(os.path.dirname(_DAILY_PRICE_CACHE_PATH), exist_ok=True)
+            cache.save(_DAILY_PRICE_CACHE_PATH)
+            logger.info("History cache saved for %s bars=%d path=%s", symbol, len(bars), _DAILY_PRICE_CACHE_PATH)
+        except Exception as exc:
+            logger.debug("daily cache history persist failed for %s: %s", symbol, exc)
+
+    def _load_daily_cache_history_bars(self, symbol: str, months: int = 6) -> list[dict[str, Any]]:
+        try:
+            cache_module = __import__("daily_price_cache")
+            cache = cache_module.DailyPriceCache()
+            cache.load(_DAILY_PRICE_CACHE_PATH)
+            raw = cache._data.get(symbol, {})
+            if not raw:
+                return []
+
+            dates = sorted(raw.keys())[-max(1, months * 31) :]
+            bars: list[dict[str, Any]] = []
+            for date in dates:
+                bar = raw.get(date)
+                if bar is None:
+                    continue
+                dt = datetime.datetime.fromisoformat(date).replace(hour=17, minute=0, second=0, microsecond=0)
+                bars.append(
+                    {
+                        "time": int(dt.timestamp() * 1000),
+                        "open": round(float(bar.open), 2),
+                        "high": round(float(bar.high), 2),
+                        "low": round(float(bar.low), 2),
+                        "close": round(float(bar.close), 2),
+                        "volume": int(bar.volume),
+                    }
+                )
+            return bars
+        except Exception as exc:
+            logger.debug("daily cache history load failed for %s: %s", symbol, exc)
+            return []
+
+    def _has_cached_history_bars(self, symbol: str, months: int = 6) -> bool:
+        return len(self._load_daily_cache_history_bars(symbol, months)) > 0
+
+    def _spawn_history_preload_process(self, symbols: list[str], months: int = 6) -> None:
+        process = multiprocessing.Process(
+            target=_preload_history_cache_worker,
+            args=(symbols, months, _DAILY_PRICE_CACHE_PATH),
+            daemon=True,
+        )
+        process.start()
+        self._history_preload_processes.append(process)
 
     def _load_kbars_with_retry_sync(
         self,
@@ -619,11 +815,10 @@ class SinopacCollector:
         if loop is None:
             return
 
-        symbol = str(payload.get("symbol", "")).strip()
-        if not symbol:
-            return
-
         if payload.get("type") == "paper_trade":
+            symbol = str(payload.get("symbol", "")).strip()
+            if not symbol:
+                return
             if self._auto_trader is None:
                 await websocket.send(
                     json.dumps(
@@ -678,6 +873,9 @@ class SinopacCollector:
             return
 
         if payload.get("type") == "subscribe_quote_detail":
+            symbol = str(payload.get("symbol", "")).strip()
+            if not symbol:
+                return
             self._quote_detail_subscriptions[websocket] = symbol if symbol in self._symbols else None
             if symbol in self._symbols:
                 await self._send_quote_detail_snapshots(websocket, symbol)
@@ -687,32 +885,89 @@ class SinopacCollector:
             self._quote_detail_subscriptions[websocket] = None
             return
 
+        if payload.get("type") == "preload_history":
+            raw_symbols = payload.get("symbols", [])
+            if not isinstance(raw_symbols, list):
+                return
+            months = max(1, int(payload.get("months", 6)))
+            symbols = [
+                str(symbol).strip()
+                for symbol in raw_symbols
+                if str(symbol).strip()
+                and str(symbol).strip() in self._symbols
+                and str(symbol).strip() not in self._history_preload_inflight
+                and not self._has_cached_history_bars(str(symbol).strip(), months)
+            ]
+            if not symbols:
+                logger.info("History preload skipped: no uncached symbols")
+                return
+            logger.info("History preload requested symbols=%s months=%d", symbols, months)
+            self._history_preload_inflight.update(symbols)
+            self._spawn_history_preload_process(symbols, months)
+            for symbol in symbols:
+                self._history_preload_inflight.discard(symbol)
+            return
+
         if payload.get("type") == "session_bars":
+            symbol = str(payload.get("symbol", "")).strip()
+            if not symbol:
+                return
             limit = max(1, int(payload.get("limit", 240)))
-            candles = await loop.run_in_executor(None, self._session_bars_sync, symbol, limit)
-            source = "sinopac" if candles else "fallback"
+            source = "sinopac"
+            error: str | None = None
+            try:
+                candles = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._session_bars_sync, symbol, limit),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("session bars timed out for %s; serving fallback", symbol)
+                candles = await loop.run_in_executor(None, self._build_fallback_session_bars, symbol, limit)
+                source = "fallback"
+                error = "session_bars_timeout"
+            if not candles:
+                source = "fallback"
             message = {
                 "type": "SESSION_BARS",
                 "symbol": symbol,
                 "candles": candles,
                 "source": source,
             }
-            if not candles:
+            if error:
+                message["error"] = error
+            elif not candles:
                 message["error"] = "session_bars_unavailable"
             await websocket.send(json.dumps(message, separators=(",", ":")))
             return
 
         if payload.get("type") == "history_bars":
+            symbol = str(payload.get("symbol", "")).strip()
+            if not symbol:
+                return
             months = max(1, int(payload.get("months", 6)))
-            candles = await loop.run_in_executor(None, self._history_bars_sync, symbol, months)
-            source = "sinopac" if candles else "fallback"
+            source = "sinopac"
+            error: str | None = None
+            try:
+                candles = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._history_bars_sync, symbol, months),
+                    timeout=75.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("history bars timed out for %s; serving fallback", symbol)
+                candles = await loop.run_in_executor(None, self._build_fallback_history_bars, symbol, months)
+                source = "fallback"
+                error = "history_bars_timeout"
+            if not candles:
+                source = "fallback"
             message = {
                 "type": "HISTORY_BARS",
                 "symbol": symbol,
                 "candles": candles,
                 "source": source,
             }
-            if not candles:
+            if error:
+                message["error"] = error
+            elif not candles:
                 message["error"] = "history_bars_unavailable"
             await websocket.send(json.dumps(message, separators=(",", ":")))
 

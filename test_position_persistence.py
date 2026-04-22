@@ -1,7 +1,9 @@
 """Tests for position persistence (open → DB write, close → DB delete, restart → restore)."""
 from __future__ import annotations
 
+import logging
 import types
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +19,7 @@ class _FakeRiskManager:
         self.rolling_5day_pnl = 0.0
         self.is_halted = False
         self.is_weekly_halted = False
+        self.min_net_profit_pct = 1.085
 
     def can_buy(self, symbol: str, price: float, shares: int, current_positions: int) -> tuple[bool, str]:
         return True, "OK"
@@ -27,6 +30,9 @@ class _FakeRiskManager:
     def calc_target_price(self, price: float, stop_price: float) -> float:
         risk = price - stop_price
         return round(price + risk * 2, 2)
+
+    def calc_position_shares(self, price: float, stop_price: float, lot_size: int = 1000) -> int:
+        return lot_size
 
     def on_buy(self, symbol: str, price: float, shares: int) -> None:
         pass
@@ -115,6 +121,7 @@ async def test_open_position_calls_upsert() -> None:
     assert call_kwargs["symbol"] == _BUY_SYMBOL
     assert call_kwargs["side"] == "long"
     assert call_kwargs["entry_price"] == round(_BUY_PRICE * 1.0005, 2)
+    assert "session_id" not in call_kwargs
 
 
 @pytest.mark.asyncio
@@ -142,6 +149,7 @@ async def test_close_position_calls_delete() -> None:
     delete_mock.assert_called_once()
     call_kwargs = delete_mock.call_args.kwargs
     assert call_kwargs["symbol"] == _BUY_SYMBOL
+    assert "session_id" not in call_kwargs
 
 
 @pytest.mark.asyncio
@@ -226,3 +234,35 @@ async def test_persist_position_skipped_when_db_is_none() -> None:
     trader._persist_trade = types.MethodType(_noop, trader)
     # Should complete without error even with no DB
     await trader._persist_position_open("2330")
+
+
+@pytest.mark.asyncio
+async def test_trade_persistence_is_disabled_after_connection_failure(caplog) -> None:
+    trader = _make_trader()
+    trader._persist_trade = types.MethodType(AutoTrader._persist_trade, trader)
+    record = types.SimpleNamespace(
+        symbol="2330",
+        action="BUY",
+        price=100.0,
+        shares=100,
+        reason="MANUAL",
+        pnl=0.0,
+        gross_pnl=0.0,
+        ts=1_775_500_000_000,
+        stop_price=97.0,
+        target_price=106.0,
+    )
+
+    @asynccontextmanager
+    async def _broken_get_session():
+        raise OSError(1225, "遠端電腦拒絕網路連線。")
+        yield  # pragma: no cover
+
+    with patch("models.get_session", _broken_get_session):
+        with caplog.at_level(logging.WARNING, logger="auto_trader"):
+            await trader._persist_trade(record)
+            await trader._persist_trade(record)
+
+    warning_messages = [message for message in caplog.messages if "Trade persistence failed" in message]
+    assert len(warning_messages) == 1
+    assert trader._db is None

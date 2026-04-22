@@ -405,7 +405,7 @@ class AutoTrader:
         """
         if self._daily_price_cache is not None:
             atr = self._daily_price_cache.atr(
-                symbol, period=period, as_of_date=_prev_trade_date()
+                symbol, period=period, as_of_date=self._prev_trade_date()
             )
             if atr is not None and atr > 0:
                 return atr
@@ -454,7 +454,8 @@ class AutoTrader:
         return False
 
     def _swing_trade_date(self) -> str:
-        return self._current_date or datetime.datetime.now(tz=_TZ_TW).strftime("%Y-%m-%d")
+        current_trade_date = self._current_date or datetime.datetime.now(tz=_TZ_TW).strftime("%Y-%m-%d")
+        return _previous_known_open_trading_date(current_trade_date)
 
     def get_retail_flow_watch_state(self, symbol: str) -> str | None:
         return self._swing_runtime.watch_states.get(symbol)
@@ -585,14 +586,10 @@ class AutoTrader:
 
     def _prev_trade_date(self) -> str:
         """回傳前一個交易日日期字串（用於日線指標，因今日未收盤）。"""
-        today = self._swing_trade_date()
+        current_trade_date = self._current_date or datetime.datetime.now(tz=_TZ_TW).strftime("%Y-%m-%d")
         if self._daily_price_cache is not None:
-            # 從快取已有資料中找最近一個 <= 昨日的日期
-            import datetime as _dt
-            today_dt = _dt.date.fromisoformat(today)
-            prev = (today_dt - _dt.timedelta(days=1)).isoformat()
-            return prev
-        return today
+            return _previous_known_open_trading_date(current_trade_date)
+        return current_trade_date
 
     def _is_above_ma10(self, symbol: str, price: float) -> bool:
         """判斷現價是否在 10 日均線上方。優先使用日線快取；無資料時寬鬆通過。"""
@@ -2698,6 +2695,15 @@ def _ts_to_date(ts_ms: int) -> str:
     return _ts_to_datetime(ts_ms).strftime("%Y-%m-%d")
 
 
+def _previous_known_open_trading_date(date_str: str) -> str:
+    base_date = datetime.date.fromisoformat(date_str)
+    for offset in range(1, 15):
+        candidate = base_date - datetime.timedelta(days=offset)
+        if is_known_open_trading_date(candidate):
+            return candidate.isoformat()
+    return (base_date - datetime.timedelta(days=1)).isoformat()
+
+
 def _is_trading_hours(ts_ms: int) -> bool:
     """Return True during the trading session window (08:00–17:00)."""
     dt = _ts_to_datetime(ts_ms)
@@ -2722,15 +2728,12 @@ def _is_opening_breakout_window(ts_ms: int) -> bool:
 
 
 def _is_swing_entry_window(ts_ms: int) -> bool:
-    """Return True during the swing-strategy entry window (09:00–10:00).
+    """Return True during the regular Taiwan cash-session hours.
 
-    Swing entries are based on the *previous* day's institutional data (T+1).
-    Limiting evaluation to the first 60 minutes avoids chasing intraday moves
-    and keeps entry timing aligned with the overnight decision.
+    For swing trading, entries should remain available throughout the normal
+    session rather than being limited to the first hour.
     """
-    dt = _ts_to_datetime(ts_ms)
-    t = dt.hour * 60 + dt.minute
-    return 9 * 60 <= t <= 10 * 60
+    return _is_trading_hours(ts_ms)
 
 
 def _cover_reason_label(reason: str) -> str:
