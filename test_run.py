@@ -477,7 +477,8 @@ def test_runtime_primes_institutional_flow_cache_when_swing_mode_enabled(monkeyp
 
     cache = captured["institutional_flow_cache"]
     assert cache.stored
-    assert cache.stored[0][0] == "2026-04-17"
+    # retail_flow_swing uses T+1 data: cache is primed with the previous trading day
+    assert cache.stored[0][0] == "2026-04-16"
     assert cache.stored[0][1][0].symbol == "2330"
 
 
@@ -590,7 +591,8 @@ def test_strategy_runtime_primes_institutional_flow_cache(monkeypatch, tmp_path)
     assert cache.saved == [str(cache_path)]
     assert cache.pruned == 1
     assert cache.stored
-    assert cache.stored[0][0] == "2026-04-19"
+    # retail_flow_swing uses T+1 data: cache is primed with the previous open trading day
+    assert cache.stored[0][0] == "2026-04-17"
     assert cache.stored[0][1][0].symbol == "2330"
 
 

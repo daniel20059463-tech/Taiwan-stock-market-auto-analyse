@@ -9,6 +9,7 @@ import Dashboard from "./components/Dashboard";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { MarketDataProvider } from "./components/MarketDataProvider";
 import { DEFAULT_TW_STOCKS } from "./data/twStocks";
+import { BacktestLeaderboard } from "./pages/BacktestLeaderboard";
 import { Performance } from "./pages/Performance";
 import { StrategyConfig } from "./pages/StrategyConfig";
 import { StrategyWorkbench } from "./pages/StrategyWorkbench";
@@ -160,6 +161,14 @@ export function App() {
                 element={
                   <ErrorBoundary label="交易回放">
                     <TradeReplay />
+                  </ErrorBoundary>
+                }
+              />
+              <Route
+                path="/backtest"
+                element={
+                  <ErrorBoundary label="回測排行榜">
+                    <BacktestLeaderboard />
                   </ErrorBoundary>
                 }
               />

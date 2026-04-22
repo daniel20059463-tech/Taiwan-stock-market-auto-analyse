@@ -653,8 +653,8 @@ class AutoTrader:
             self._set_retail_flow_non_entry_reason(symbol, "strategy_unavailable")
             return
 
-        # 波段進場只在開盤後 60 分鐘內評估（09:00–10:00）
-        # 籌碼資料是前一日的（T+1 延遲），應以昨日為基準在開盤時決策
+        # 波段進場在整個交易時段（09:00–13:30）皆可進場
+        # 籌碼資料是前一日的（T+1 延遲），以 _swing_trade_date() 取前一交易日
         if not _is_swing_entry_window(ts_ms):
             self._set_retail_flow_non_entry_reason(symbol, "outside_entry_window")
             return
@@ -2236,6 +2236,8 @@ class AutoTrader:
 
         # 同類股集中度限制：同一類股最多 MAX_SECTOR_POSITIONS 個持倉
         sector = self._symbol_sectors.get(symbol, "")
+        if not sector:
+            logger.debug("sector_check skipped: %s has no registered sector", symbol)
         if sector:
             sector_count = sum(1 for s in self._position_sectors.values() if s == sector)
             if sector_count >= MAX_SECTOR_POSITIONS:

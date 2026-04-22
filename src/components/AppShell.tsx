@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { path: "/monitor", label: "交易監控" },
   { path: "/strategy", label: "策略作戰台" },
   { path: "/replay", label: "交易回放" },
+  { path: "/backtest", label: "回測排行榜" },
   { path: "/performance", label: "績效分析" },
   { path: "/config", label: "策略設定" },
 ] as const;

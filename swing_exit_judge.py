@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-MAX_HOLDING_DAYS = 20
+MAX_HOLDING_DAYS = 15
 FLOW_EXIT_MIN_DAYS = 3      # require flow to be weak for at least N days before exiting
 MA10_BUFFER_PCT = 0.5       # allow price to be below MA10 by this % before triggering
 

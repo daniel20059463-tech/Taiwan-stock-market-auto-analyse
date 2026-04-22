@@ -96,14 +96,25 @@ class DailyPriceCache:
         period: int = 14,
         as_of_date: str | None = None,
     ) -> float | None:
-        """Return simple ATR (average high-low range) over the last *period* daily bars."""
+        """Return ATR using True Range (high-low, high-prev_close, low-prev_close)."""
         dates = sorted(self._data.get(symbol, {}).keys())
         if as_of_date:
             dates = [d for d in dates if d <= as_of_date]
-        bars = [self._data[symbol][d] for d in dates[-period:]]
-        if len(bars) < period:
+        # Need period+1 bars so every bar has a previous bar for prev_close
+        bars = [self._data[symbol][d] for d in dates[-(period + 1):]]
+        if len(bars) < period + 1:
             return None
-        return sum(b.high - b.low for b in bars) / period
+        true_ranges: list[float] = []
+        for i in range(1, len(bars)):
+            prev_close = bars[i - 1].close
+            bar = bars[i]
+            tr = max(
+                bar.high - bar.low,
+                abs(bar.high - prev_close),
+                abs(bar.low - prev_close),
+            )
+            true_ranges.append(tr)
+        return sum(true_ranges) / period
 
     def has_enough_data(self, symbol: str, min_bars: int) -> bool:
         return len(self._data.get(symbol, {})) >= min_bars

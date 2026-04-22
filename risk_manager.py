@@ -29,7 +29,7 @@ TX_TAX_SELL_PCT = 0.3000
 TX_TOTAL_RT_PCT = TX_FEE_BUY_PCT + TX_FEE_SELL_PCT + TX_TAX_SELL_PCT
 MIN_NET_PROFIT_PCT = TX_TOTAL_RT_PCT + 0.5  # 來回成本 + 0.5% 安全邊際
 
-ROLLING_5DAY_LOSS_PCT = 5.0
+ROLLING_5DAY_LOSS_PCT = 6.0
 MAX_GLOBAL_DRAWDOWN_PCT = 15.0
 
 
@@ -257,7 +257,8 @@ class RiskManager:
 
     @property
     def rolling_5day_pnl(self) -> float:
-        return sum(pnl for _, pnl in self._state.daily_pnl_history)
+        archived = sum(pnl for _, pnl in self._state.daily_pnl_history)
+        return archived + self._state.daily_realized_pnl
 
     @property
     def is_weekly_halted(self) -> bool:

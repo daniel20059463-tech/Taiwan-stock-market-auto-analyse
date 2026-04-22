@@ -68,6 +68,7 @@ class BacktestRunner:
         self,
         bars: list[BacktestBar],
         flow_rows_by_date: dict[str, list] | None = None,
+        daily_price_cache: Any = None,
     ) -> BacktestResult:
         """
         Run the backtest.
@@ -77,6 +78,9 @@ class BacktestRunner:
             flow_rows_by_date: Optional dict mapping date strings ("YYYY-MM-DD")
                 to lists of InstitutionalFlowRow, pre-loaded into the trader's
                 institutional flow cache before replay starts.
+            daily_price_cache: Optional DailyPriceCache instance. When provided,
+                injected into the trader so ATR/MA/RSI calculations match live
+                behaviour instead of falling back to the mid-stop default.
         """
         trader = self._factory()
 
@@ -86,12 +90,18 @@ class BacktestRunner:
                 for date_str, rows in flow_rows_by_date.items():
                     cache.store(trade_date=date_str, rows=rows)
 
+        if daily_price_cache is not None and hasattr(trader, "set_daily_price_cache"):
+            trader.set_daily_price_cache(daily_price_cache)
+
         sorted_bars = sorted(bars, key=lambda b: b.ts_ms)
         for bar in sorted_bars:
             for tick in _bar_to_ticks(bar):
                 await trader.on_tick(tick)
 
-        return _compute_result(trader._book.trade_history)
+        initial_equity = float(
+            getattr(getattr(trader, "_risk", None), "account_capital", 1_000_000.0)
+        )
+        return _compute_result(trader._book.trade_history, initial_equity=initial_equity)
 
 
 def _bar_to_ticks(bar: BacktestBar) -> list[dict[str, Any]]:
@@ -130,7 +140,7 @@ def _bar_to_ticks(bar: BacktestBar) -> list[dict[str, Any]]:
     return ticks
 
 
-def _compute_result(trade_history: list) -> BacktestResult:
+def _compute_result(trade_history: list, *, initial_equity: float = 1_000_000.0) -> BacktestResult:
     sells = [t for t in trade_history if getattr(t, "action", None) in {"SELL", "COVER"}]
 
     if not sells:
@@ -149,7 +159,7 @@ def _compute_result(trade_history: list) -> BacktestResult:
     total_pnl = sum(t.pnl for t in sells)
     win_rate = win_trades / len(sells)
     avg_pnl = total_pnl / len(sells)
-    max_dd = _calc_max_drawdown(sells)
+    max_dd = _calc_max_drawdown(sells, initial_equity=initial_equity)
 
     records = [
         {
@@ -175,19 +185,19 @@ def _compute_result(trade_history: list) -> BacktestResult:
     )
 
 
-def _calc_max_drawdown(sells: list) -> float:
-    """Calculate max drawdown % from cumulative PnL peak."""
+def _calc_max_drawdown(sells: list, *, initial_equity: float = 1_000_000.0) -> float:
+    """Calculate max drawdown % from an equity curve anchored by initial equity."""
     if not sells:
         return 0.0
-    cumulative = 0.0
-    peak = 0.0
+    equity = float(initial_equity)
+    peak_equity = equity
     max_dd = 0.0
     for trade in sells:
-        cumulative += trade.pnl
-        if cumulative > peak:
-            peak = cumulative
-        if peak > 0:
-            dd = (peak - cumulative) / peak * 100
+        equity += float(trade.pnl)
+        if equity > peak_equity:
+            peak_equity = equity
+        if peak_equity > 0:
+            dd = (peak_equity - equity) / peak_equity * 100
             if dd > max_dd:
                 max_dd = dd
     return max_dd

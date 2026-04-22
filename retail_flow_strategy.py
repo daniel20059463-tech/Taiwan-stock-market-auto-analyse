@@ -37,7 +37,7 @@ def should_enter_position(*, watch_state: str) -> bool:
     return watch_state == "ready_to_buy"
 
 
-MAX_SWING_HOLDING_DAYS = 10  # 波段最長持有天數
+MAX_SWING_HOLDING_DAYS = 15  # 波段最長持有天數
 
 
 def should_exit_position(

@@ -96,7 +96,7 @@ def test_should_exit_position_when_holding_days_exceed_limit() -> None:
         stop_loss_hit=False,
         close_below_ma10=False,
         flow_weakened=False,
-        holding_days=11,
+        holding_days=16,
     ) == "time_exit"
 
 
