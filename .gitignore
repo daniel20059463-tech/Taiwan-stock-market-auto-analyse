@@ -27,3 +27,4 @@ src-tauri/backend/*.dll
 .tauri-signing-key.pub
 build/
 latest.json
+backtest_results/
