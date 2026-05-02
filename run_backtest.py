@@ -4,7 +4,7 @@ CLI for running a strategy backtest on a single Taiwan stock symbol.
 Usage:
     python run_backtest.py 2330
     python run_backtest.py 2330 2025-01-01 2025-03-31
-    python run_backtest.py 2330 2025-01-01 2025-03-31 --mode intraday
+    python run_backtest.py 2330 2025-01-01 2025-03-31 --mode retail_flow_swing
 
 Results are saved automatically:
     backtest_results/YYYY-MM/<symbol>_<start>_<end>_<mode>.json  (full detail)
@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         default="retail_flow_swing",
-        choices=["retail_flow_swing", "intraday"],
+        choices=["retail_flow_swing"],
         help="Strategy mode (default: retail_flow_swing)",
     )
     parser.add_argument(
@@ -148,10 +148,16 @@ def parse_args() -> argparse.Namespace:
         default=DETAIL_KEEP_DAYS,
         help=f"Days to keep detail JSON files (default: {DETAIL_KEEP_DAYS})",
     )
+    parser.add_argument(
+        "--slippage-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to resolved execution slippage (default: 1.0)",
+    )
     return parser.parse_args()
 
 
-def make_trader(mode: str):
+def make_trader(mode: str, slippage_multiplier: float):
     from auto_trader import AutoTrader
     from risk_manager import risk_manager_from_env
 
@@ -161,10 +167,18 @@ def make_trader(mode: str):
         chat_id="",
         strategy_mode=mode,
         risk_manager=risk,
+        slippage_multiplier=slippage_multiplier,
     )
 
 
-async def run(symbol: str, start_date: str, end_date: str, mode: str, keep_days: int) -> None:
+async def run(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    mode: str,
+    keep_days: int,
+    slippage_multiplier: float,
+) -> None:
     from backtest import BacktestRunner
     from historical_data import TWSEHistoricalFetcher
 
@@ -176,13 +190,30 @@ async def run(symbol: str, start_date: str, end_date: str, mode: str, keep_days:
         print("No bars fetched. Check the symbol or date range.")
         sys.exit(1)
 
+    # 抓取 0050（元大台灣50）作為大盤強弱代理，供市場篩選器使用
+    print("正在抓取 0050（大盤代理）做市場強弱判斷 ...")
+    market_index_by_date: dict[str, float] = {}
+    try:
+        taiex_bars = fetcher.fetch_bars("0050", start_date, end_date)
+        for tbar in taiex_bars:
+            if tbar.previous_close and tbar.previous_close > 0:
+                change_pct = (tbar.close - tbar.previous_close) / tbar.previous_close * 100
+                dt = datetime.datetime.fromtimestamp(tbar.ts_ms / 1000, tz=_TZ_TW)
+                market_index_by_date[dt.strftime("%Y-%m-%d")] = round(change_pct, 2)
+        print(f"  已載入 {len(market_index_by_date)} 個交易日的大盤資料。")
+    except Exception as exc:
+        print(f"  警告：無法抓取 0050（{exc}），大盤篩選器將停用。")
+
     print(f"已抓到 {len(bars)} 根 K 棒，開始執行 [{mode}] 回測 ...")
-    runner = BacktestRunner(auto_trader_factory=lambda: make_trader(mode))
-    result = await runner.run(bars=bars)
+    runner = BacktestRunner(
+        auto_trader_factory=lambda: make_trader(mode, slippage_multiplier)
+    )
+    result = await runner.run(bars=bars, market_index_by_date=market_index_by_date or None)
 
     sep = "=" * 52
     print(f"\n{sep}")
     print(f"  BACKTEST  {symbol}  {start_date} -> {end_date}  [{mode}]")
+    print(f"  滑價倍數      : {slippage_multiplier:.2f}x")
     print(sep)
     print(f"  總交易數     : {result.total_trades}")
     print(f"  勝場 / 敗場  : {result.win_trades} / {result.loss_trades}")
@@ -232,7 +263,16 @@ def main() -> None:
     args = parse_args()
     start = args.start_date or _days_ago(90)
     end = args.end_date or _today()
-    asyncio.run(run(args.symbol, start, end, args.mode, args.keep_days))
+    asyncio.run(
+        run(
+            args.symbol,
+            start,
+            end,
+            args.mode,
+            args.keep_days,
+            args.slippage_multiplier,
+        )
+    )
 
 
 if __name__ == "__main__":

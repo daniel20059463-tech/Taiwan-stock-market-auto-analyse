@@ -55,6 +55,21 @@ export interface TradeTapeSnapshot {
   rows: TradeTapeRow[];
 }
 
+// ── 國際新聞 ──────────────────────────────────────────────────────────────────
+
+export interface NewsItem {
+  title: string;
+  summary: string;
+  source: string;
+  url: string;
+  published_at: string;
+}
+
+export interface NewsFeed {
+  updatedAt: string;
+  items: NewsItem[];
+}
+
 // ── Store 型別定義 ────────────────────────────────────────────────────────────
 
 interface MarketState {
@@ -95,6 +110,9 @@ interface MarketState {
   tradeTapes: Map<string, TradeTapeSnapshot>;
   setOrderBook: (snapshot: OrderBookSnapshot) => void;
   setTradeTape: (snapshot: TradeTapeSnapshot) => void;
+
+  newsFeed: NewsFeed | null;
+  setNewsFeed: (feed: NewsFeed) => void;
 
   desktopRuntimeAvailable: boolean;
   setDesktopRuntimeAvailable: (available: boolean) => void;
@@ -334,6 +352,9 @@ export const useMarketStore = create<MarketState>()((set) => ({
       next.set(snapshot.symbol, snapshot);
       return { tradeTapes: next };
     }),
+
+  newsFeed: null,
+  setNewsFeed: (newsFeed) => set({ newsFeed }),
 
   desktopRuntimeAvailable: false,
   setDesktopRuntimeAvailable: (desktopRuntimeAvailable) => set({ desktopRuntimeAvailable }),

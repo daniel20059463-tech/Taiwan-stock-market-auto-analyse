@@ -15,7 +15,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 MAX_DAILY_LOSS_PCT = 2.0
-MAX_POSITIONS = 5
+MAX_POSITIONS = 20
 MAX_SINGLE_POS_PCT = 10.0
 ATR_MULTIPLIER = 2.0
 MIN_STOP_PCT = 1.5

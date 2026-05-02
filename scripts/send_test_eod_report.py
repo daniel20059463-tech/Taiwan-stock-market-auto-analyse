@@ -70,8 +70,12 @@ def _sample_payload() -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send a test end-of-day Telegram report.")
-    parser.add_argument("--dry-run", action="store_true", help="Print the generated report without sending it.")
+    parser = argparse.ArgumentParser(description="Render a test end-of-day report. Sending is opt-in.")
+    parser.add_argument(
+        "--send",
+        action="store_true",
+        help="Actually send the test report to Telegram. Omit this flag for render-only output.",
+    )
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
@@ -82,8 +86,9 @@ def main() -> int:
         raise SystemExit("缺少 Telegram 設定，請先在 .env 補上 TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID。")
 
     payload = _sample_payload()
-    if args.dry_run:
+    if not args.send:
         result = reporter.build_fallback_report(payload, reporter.select_highlight_trades(payload["trades"]))
+        print("DRY_RUN_ONLY")
         print(result)
         return 0
 

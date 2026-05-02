@@ -15,7 +15,11 @@ from typing import Any, Callable
 
 from main import SharedMemoryIPC
 from market_universe import DEFAULT_TW_SYMBOLS
-from strategy_runtime import build_strategy_dependencies, prime_institutional_flow_cache
+from strategy_runtime import (
+    build_strategy_dependencies,
+    normalize_strategy_mode,
+    prime_institutional_flow_cache,
+)
 
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 logger = logging.getLogger("run")
@@ -167,6 +171,8 @@ class MockCollector:
         self._last_trade_prices = {symbol: self._prices[symbol] for symbol in symbols}
         self._market_price = 20000.0
         self._market_prev_close = 20000.0
+        from international_news import InternationalNewsFetcher
+        self._news_fetcher = InternationalNewsFetcher()
 
     async def start(self) -> None:
         import websockets
@@ -175,6 +181,7 @@ class MockCollector:
         for symbol in self._symbols:
             self._tasks.append(asyncio.create_task(self._tick_loop(symbol), name=f"mock-tick-{symbol}"))
         self._tasks.append(asyncio.create_task(self._market_index_loop(), name="mock-market-index"))
+        self._tasks.append(asyncio.create_task(self._news_broadcast_loop(), name="mock-news-broadcast"))
         logger.info("MockCollector ready on ws://%s:%d symbols=%d", self._ws_host, self._ws_port, len(self._symbols))
 
     async def stop_accepting(self) -> None:
@@ -207,6 +214,15 @@ class MockCollector:
                     await websocket.send(json.dumps(snapshot, separators=(",", ":")))
                 except Exception as exc:
                     logger.warning("Initial portfolio snapshot failed: %s", exc)
+            # Send cached news immediately on connection (non-blocking)
+            try:
+                cached_news = self._news_fetcher._cache
+                if cached_news:
+                    import datetime as _dt
+                    payload = self._news_fetcher.to_payload()
+                    await websocket.send(json.dumps(payload, separators=(",", ":")))
+            except Exception:
+                pass
             async for raw in websocket:
                 if not isinstance(raw, str):
                     continue
@@ -383,7 +399,7 @@ class MockCollector:
                 await asyncio.sleep(random.uniform(0.2, 1.0))
                 now_tw = datetime.datetime.now(tz=_TZ_TW)
                 t = now_tw.hour * 60 + now_tw.minute
-                in_trading = 8 * 60 <= t <= 17 * 60
+                in_trading = True  # MOCK: always simulate trading hours
 
                 if in_trading:
                     price = max(1.0, price * (1 + random.gauss(0, 0.0012)))
@@ -432,6 +448,22 @@ class MockCollector:
 
                 await self._broadcast(json.dumps(tick_data, separators=(",", ":")))
                 await self._broadcast_quote_detail(symbol)
+        except asyncio.CancelledError:
+            return
+
+    async def _news_broadcast_loop(self) -> None:
+        """Fetch international news and broadcast to all clients every 10 minutes."""
+        try:
+            while True:
+                try:
+                    payload = await asyncio.get_event_loop().run_in_executor(
+                        None, self._news_fetcher.to_payload
+                    )
+                    await self._broadcast(json.dumps(payload, separators=(",", ":")))
+                    logger.info("International news broadcast: %d items", len(payload.get("items", [])))
+                except Exception as exc:
+                    logger.warning("News broadcast failed: %s", exc)
+                await asyncio.sleep(600)  # refresh every 10 minutes
         except asyncio.CancelledError:
             return
 
@@ -523,7 +555,7 @@ def _scan_symbols_sync() -> Any | None:
         import shioaji as sj
         from symbol_scanner import scan_strong_symbols
 
-        top_n = int(os.getenv("SINOPAC_SCAN_TOP", "100"))
+        top_n = int(os.getenv("SINOPAC_SCAN_TOP", "50"))
         api = sj.Shioaji(simulation=os.getenv("SINOPAC_SIMULATION", "false").lower() == "true")
         api.login(
             api_key=os.environ["SINOPAC_API_KEY"],
@@ -557,6 +589,11 @@ def _env_flag(name: str, default: str = "true") -> bool:
 SECTOR_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sector_map.json")
 FULL_SECTOR_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "full_sector_map.json")
 DAILY_PRICE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "daily_price_cache.json")
+SECTOR_ROTATION_SIGNAL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "data",
+    "sector_rotation_signals.json",
+)
 DAILY_PRICE_MIN_BARS = 15
 
 
@@ -629,6 +666,68 @@ def inject_daily_price_cache(auto_trader: Any, symbols: list[str]) -> None:
         auto_trader.set_daily_price_cache(cache, DAILY_PRICE_CACHE_PATH)
 
 
+def _load_sector_rotation_signals(
+    auto_trader: Any,
+    *,
+    path: str = SECTOR_ROTATION_SIGNAL_PATH,
+    cache_cls: Any | None = None,
+) -> None:
+    if auto_trader is None or not hasattr(auto_trader, "set_sector_signal_cache"):
+        return
+    try:
+        resolved_cache_cls = cache_cls
+        if resolved_cache_cls is None:
+            cache_module = importlib.import_module("sector_rotation_signal_cache")
+            resolved_cache_cls = cache_module.SectorSignalCache
+        cache = resolved_cache_cls()
+        cache.load(path)
+        latest = cache.latest_trade_date()
+        if latest is None:
+            logger.warning("Sector rotation signal cache is empty — sector state will be unavailable")
+        else:
+            import datetime as _dt
+            tz_tw = _dt.timezone(_dt.timedelta(hours=8))
+            now_tw = _dt.datetime.now(tz=tz_tw)
+            expected_trade_date = _expected_sector_signal_trade_date(now=now_tw)
+            if expected_trade_date and latest < expected_trade_date:
+                logger.warning(
+                    "Sector rotation signal cache is stale: latest=%s expected=%s — "
+                    "run build_sector_rotation_signals.py to update",
+                    latest,
+                    expected_trade_date,
+                )
+        auto_trader.set_sector_signal_cache(cache)
+    except Exception as exc:
+        logger.warning("Failed to load sector rotation signal cache: %s", exc)
+
+
+def _expected_sector_signal_trade_date(
+    *,
+    now: datetime.datetime | None = None,
+    known_open_dates: set[str] | frozenset[str] | None = None,
+) -> str | None:
+    target = now or datetime.datetime.now(tz=_TZ_TW)
+    current_date = target.date().isoformat()
+
+    if known_open_dates is None:
+        from market_calendar import load_known_open_trading_dates
+
+        candidate_dates = set(load_known_open_trading_dates(target.year))
+        candidate_dates.update(load_known_open_trading_dates(target.year - 1))
+    else:
+        candidate_dates = set(known_open_dates)
+
+    if not candidate_dates:
+        return None
+
+    ordered = sorted(date for date in candidate_dates if date <= current_date)
+    if not ordered:
+        return None
+    if current_date in candidate_dates:
+        return ordered[-2] if len(ordered) >= 2 else None
+    return ordered[-1]
+
+
 def _save_sector_map(sector_map: dict[str, str]) -> None:
     try:
         os.makedirs(os.path.dirname(SECTOR_MAP_PATH), exist_ok=True)
@@ -670,7 +769,7 @@ def _load_sector_map_into_trader(auto_trader: Any) -> None:
 def load_auto_trader(
     enabled: bool,
     *,
-    strategy_mode: str = "intraday",
+    strategy_mode: str = "retail_flow_swing",
     build_strategy_dependencies_fn: Callable[[str], dict[str, Any]] = build_strategy_dependencies,
     prime_institutional_flow_cache_fn: Callable[[dict[str, Any]], None] = prime_institutional_flow_cache,
 ) -> Any | None:
@@ -681,10 +780,12 @@ def load_auto_trader(
     try:
         trader_module = importlib.import_module("auto_trader")
         trader_factory = getattr(trader_module, "trader_from_env")
-        strategy_dependencies = build_strategy_dependencies_fn(strategy_mode)
+        normalized_strategy_mode = normalize_strategy_mode(strategy_mode)
+        strategy_dependencies = build_strategy_dependencies_fn(normalized_strategy_mode)
         prime_institutional_flow_cache_fn(strategy_dependencies)
         trader = trader_factory(**strategy_dependencies)
         _load_sector_map_into_trader(trader)
+        _load_sector_rotation_signals(trader)
         return trader
     except Exception as exc:
         logger.warning("Auto trader unavailable, continuing with collector only: %s", exc)
@@ -763,7 +864,7 @@ def build_runtime_components(
     load_auto_trader_fn: Callable[..., Any | None] = load_auto_trader,
     inject_daily_price_cache_fn: Callable[[Any, list[str]], None] = inject_daily_price_cache,
 ) -> RuntimeComponents:
-    strategy_mode = os.getenv("STRATEGY_MODE", "intraday").strip() or "intraday"
+    strategy_mode = normalize_strategy_mode(os.getenv("STRATEGY_MODE", "retail_flow_swing"))
     auto_trader = load_auto_trader_fn(
         _env_flag("ENABLE_AUTO_TRADER", "true"),
         strategy_mode=strategy_mode,

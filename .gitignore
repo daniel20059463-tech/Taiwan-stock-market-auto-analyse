@@ -28,3 +28,5 @@ src-tauri/backend/*.dll
 build/
 latest.json
 backtest_results/
+data/paper_positions.json
+data/sector_rotation_signals.json

@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import types
 
 import pytest
@@ -112,6 +113,10 @@ class _TrackingRetailFlowSwingStrategy(RetailFlowSwingStrategy):
         return "ready_to_buy"
 
 
+async def _noop(*args, **kwargs) -> None:
+    return None
+
+
 def test_decision_reports_are_exported_and_serialized() -> None:
     factor = DecisionFactor(kind="support", label="trend", detail="price is rising")
     report = DecisionReport(
@@ -155,37 +160,27 @@ def test_decision_reports_are_exported_and_serialized() -> None:
 
 
 @pytest.mark.asyncio
-async def test_portfolio_snapshot_includes_structured_decision_reports_for_buy_and_sell() -> None:
+async def test_manual_buy_and_sell_decision_reports_are_structured() -> None:
     trader = AutoTrader(
         telegram_token="",
         chat_id="",
         risk_manager=_FakeRiskManager(),
         sentiment_filter=_FakeSentimentFilter(score=0.42, blocked=False),
     )
-
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
     trader._send = types.MethodType(_noop, trader)
     trader._persist_trade = types.MethodType(_noop, trader)
-    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
-    trader._is_near_day_high = types.MethodType(lambda self, symbol, price, payload: False, trader)
+    trader._persist_position_open = types.MethodType(_noop, trader)
+    trader._persist_position_close = types.MethodType(_noop, trader)
+    trader._last_prices["2330"] = 504.0
+    trader._open_prices["2330"] = 500.0
+    trader._prev_close_cache["2330"] = 500.0
     trader._calc_atr = types.MethodType(lambda self, symbol: 1.5, trader)
 
     buy_ts = 1_775_500_400_000
-    payload = {
-        "high": 104.0,
-        "low": 99.5,
-        "open": 100.2,
-        "previousClose": 99.0,
-        "volume": 45_000,
-    }
-
-    await trader._evaluate_buy("2330", 101.0, 2.02, buy_ts, payload)
-    await trader._paper_sell("2330", 106.5, "TAKE_PROFIT", 5.45, buy_ts + 60_000)
+    await trader.execute_manual_trade(symbol="2330", action="BUY", shares=1000, ts_ms=buy_ts)
+    await trader.execute_manual_trade(symbol="2330", action="SELL", shares=1000, ts_ms=buy_ts + 60_000)
 
     snapshot = trader.get_portfolio_snapshot()
-
     assert len(snapshot["recentTrades"]) == 2
     assert len(snapshot["recentDecisions"]) >= 2
 
@@ -195,82 +190,15 @@ async def test_portfolio_snapshot_includes_structured_decision_reports_for_buy_a
     sell_report = sell_trade["decisionReport"]
 
     assert buy_report["decisionType"] == "buy"
-    assert buy_report["triggerType"] == "mixed"
+    assert buy_report["triggerType"] == "manual"
     assert buy_report["orderResult"]["status"] == "executed"
-    assert any(factor["kind"] == "support" for factor in buy_report["supportingFactors"])
-    assert buy_report["confidence"] > 0
-    assert isinstance(buy_report["bullCase"], str) and buy_report["bullCase"]
-    assert isinstance(buy_report["bearCase"], str) and buy_report["bearCase"]
-    assert isinstance(buy_report["riskCase"], str) and buy_report["riskCase"]
-    assert isinstance(buy_report["bullArgument"], str) and buy_report["bullArgument"]
-    assert isinstance(buy_report["bearArgument"], str) and buy_report["bearArgument"]
-    assert isinstance(buy_report["refereeVerdict"], str) and buy_report["refereeVerdict"]
-    assert buy_report["debateWinner"] in {"bull", "bear", "tie"}
-
     assert sell_report["decisionType"] == "sell"
-    assert sell_report["finalReason"] == "take_profit"
     assert sell_report["orderResult"]["status"] == "executed"
-    assert any(flag == "target_hit" for flag in sell_report["riskFlags"])
-    assert isinstance(sell_report["bullCase"], str) and sell_report["bullCase"]
-    assert isinstance(sell_report["bearCase"], str) and sell_report["bearCase"]
-    assert isinstance(sell_report["riskCase"], str) and sell_report["riskCase"]
-    assert isinstance(sell_report["bullArgument"], str) and sell_report["bullArgument"]
-    assert isinstance(sell_report["bearArgument"], str) and sell_report["bearArgument"]
-    assert isinstance(sell_report["refereeVerdict"], str) and sell_report["refereeVerdict"]
+    assert sell_report["finalReason"] == "manual"
 
 
 @pytest.mark.asyncio
-async def test_buy_skip_is_recorded_as_replayable_decision_report() -> None:
-    trader = AutoTrader(
-        telegram_token="",
-        chat_id="",
-        risk_manager=_FakeRiskManager(),
-        sentiment_filter=_FakeSentimentFilter(score=-0.72, blocked=True),
-    )
-
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
-    trader._send = types.MethodType(_noop, trader)
-    trader._persist_trade = types.MethodType(_noop, trader)
-    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
-    trader._is_near_day_high = types.MethodType(lambda self, symbol, price, payload: False, trader)
-    trader._calc_atr = types.MethodType(lambda self, symbol: 1.2, trader)
-
-    await trader._evaluate_buy(
-        "2454",
-        1288.0,
-        2.6,
-        1_775_500_700_000,
-        {
-            "high": 1292.0,
-            "low": 1258.0,
-            "open": 1261.0,
-            "previousClose": 1255.0,
-            "volume": 80_000,
-        },
-    )
-
-    snapshot = trader.get_portfolio_snapshot()
-
-    assert snapshot["recentTrades"] == []
-    assert snapshot["recentDecisions"], "expected skip decision to be replayable"
-
-    latest = snapshot["recentDecisions"][-1]
-    assert latest["decisionType"] == "skip"
-    assert latest["finalReason"] == "sentiment_blocked"
-    assert latest["orderResult"]["status"] == "skipped"
-    assert any(factor["kind"] == "oppose" for factor in latest["opposingFactors"])
-    assert isinstance(latest["bullCase"], str) and latest["bullCase"]
-    assert isinstance(latest["bearCase"], str) and latest["bearCase"]
-    assert isinstance(latest["riskCase"], str) and latest["riskCase"]
-    assert isinstance(latest["bullArgument"], str) and latest["bullArgument"]
-    assert isinstance(latest["bearArgument"], str) and latest["bearArgument"]
-    assert isinstance(latest["refereeVerdict"], str) and latest["refereeVerdict"]
-
-
-@pytest.mark.asyncio
-async def test_auto_trader_triggers_delayed_eod_report_once_positions_closed() -> None:
+async def test_eod_report_uses_completed_manual_sell_trades() -> None:
     reporter = _FakeDailyReporter()
     trader = AutoTrader(
         telegram_token="",
@@ -280,155 +208,22 @@ async def test_auto_trader_triggers_delayed_eod_report_once_positions_closed() -
         daily_reporter=reporter,
         eod_report_delay_seconds=0.01,
     )
-
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
     trader._send = types.MethodType(_noop, trader)
     trader._persist_trade = types.MethodType(_noop, trader)
-    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
-    trader._is_near_day_high = types.MethodType(lambda self, symbol, price, payload: False, trader)
+    trader._persist_position_open = types.MethodType(_noop, trader)
+    trader._persist_position_close = types.MethodType(_noop, trader)
+    trader._last_prices["2330"] = 504.0
+    trader._open_prices["2330"] = 500.0
+    trader._prev_close_cache["2330"] = 500.0
     trader._calc_atr = types.MethodType(lambda self, symbol: 1.0, trader)
 
     ts_ms = 1_775_500_400_000
-    payload = {
-        "high": 104.0,
-        "low": 99.5,
-        "open": 100.2,
-        "previousClose": 99.0,
-        "volume": 45_000,
-    }
-
-    await trader._evaluate_buy("2330", 101.0, 2.02, ts_ms, payload)
-    await trader._close_all_eod(ts_ms + 1_000)
-    await asyncio.sleep(0.05)
-
-    assert len(reporter.calls) == 1
-    assert reporter.calls[0]["tradeCount"] >= 1
-
-
-@pytest.mark.asyncio
-async def test_eod_report_counts_cover_trades_for_short_only_day() -> None:
-    reporter = _FakeDailyReporter()
-    trader = AutoTrader(
-        telegram_token="",
-        chat_id="",
-        risk_manager=_FakeRiskManager(),
-        sentiment_filter=_FakeSentimentFilter(score=-0.55, blocked=False),
-        daily_reporter=reporter,
-        eod_report_delay_seconds=0.01,
-    )
-
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
-    trader._send = types.MethodType(_noop, trader)
-    trader._persist_trade = types.MethodType(_noop, trader)
-    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
-    trader._calc_atr = types.MethodType(lambda self, symbol: 1.2, trader)
-
-    ts_ms = 1_775_500_700_000
-    payload = {
-        "high": 1312.0,
-        "low": 1280.0,
-        "open": 1308.0,
-        "previousClose": 1315.0,
-        "volume": 80_000,
-    }
-
-    await trader._evaluate_short("2454", 1288.0, -2.1, ts_ms, payload)
-    await trader._paper_cover("2454", 1200.0, "TAKE_PROFIT", 6.83, ts_ms + 60_000)
+    await trader.execute_manual_trade(symbol="2330", action="BUY", shares=1000, ts_ms=ts_ms)
+    await trader.execute_manual_trade(symbol="2330", action="SELL", shares=1000, ts_ms=ts_ms + 1_000)
     await trader._run_eod_report_after_delay(ts_ms + 120_000)
 
     assert len(reporter.calls) == 1
     assert reporter.calls[0]["tradeCount"] == 1
-    assert reporter.calls[0]["winRate"] == 100.0
-
-
-@pytest.mark.asyncio
-async def test_short_and_cover_decision_reports_have_correct_types() -> None:
-    trader = AutoTrader(
-        telegram_token="",
-        chat_id="",
-        risk_manager=_FakeRiskManager(),
-        sentiment_filter=_FakeSentimentFilter(score=-0.55, blocked=False),
-    )
-
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
-    trader._send = types.MethodType(_noop, trader)
-    trader._persist_trade = types.MethodType(_noop, trader)
-    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
-    trader._calc_atr = types.MethodType(lambda self, symbol: 1.2, trader)
-
-    ts_ms = 1_775_500_700_000
-    payload = {
-        "high": 1312.0,
-        "low": 1280.0,
-        "open": 1308.0,
-        "previousClose": 1315.0,
-        "volume": 80_000,
-    }
-
-    await trader._evaluate_short("2454", 1288.0, -2.1, ts_ms, payload)
-    await trader._paper_cover("2454", 1200.0, "TAKE_PROFIT", 6.83, ts_ms + 60_000)
-
-    snapshot = trader.get_portfolio_snapshot()
-
-    short_trade = snapshot["recentTrades"][0]
-    cover_trade = snapshot["recentTrades"][1]
-    short_report = short_trade["decisionReport"]
-    cover_report = cover_trade["decisionReport"]
-
-    assert short_trade["action"] == "SHORT"
-    assert short_report["decisionType"] == "short"
-    assert short_report["orderResult"]["status"] == "executed"
-    assert isinstance(short_report["bearCase"], str) and short_report["bearCase"]
-
-    assert cover_trade["action"] == "COVER"
-    assert cover_report["decisionType"] == "cover"
-    assert cover_report["orderResult"]["status"] == "executed"
-
-
-@pytest.mark.asyncio
-async def test_swing_strategy_path_does_not_trigger_eod_flatten() -> None:
-    trader = AutoTrader(
-        telegram_token="",
-        chat_id="",
-        risk_manager=_FakeRiskManager(),
-        sentiment_filter=_FakeSentimentFilter(score=0.2, blocked=False),
-        strategy_mode="retail_flow_swing",
-        retail_flow_strategy=RetailFlowSwingStrategy(),
-        institutional_flow_cache=InstitutionalFlowCache(),
-    )
-
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
-    close_calls: list[int] = []
-
-    async def _fake_close_all_eod(self, ts_ms: int) -> None:
-        close_calls.append(ts_ms)
-
-    trader._send = types.MethodType(_noop, trader)
-    trader._persist_trade = types.MethodType(_noop, trader)
-    trader._close_all_eod = types.MethodType(_fake_close_all_eod, trader)
-
-    await trader.on_tick(
-        {
-            "symbol": "2330",
-            "price": 101.0,
-            "volume": 1000,
-            "ts": 1_775_500_400_000 + ((13 * 60 + 26) * 60 * 1000),
-            "previousClose": 100.0,
-            "open": 100.0,
-            "high": 101.0,
-            "low": 99.5,
-        }
-    )
-
-    assert close_calls == []
 
 
 @pytest.mark.asyncio
@@ -457,11 +252,6 @@ async def test_swing_strategy_uses_retail_flow_entry_logic() -> None:
         institutional_flow_cache=cache,
     )
 
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
-    buy_calls: list[tuple[str, float, int]] = []
-
     class _FakeExecution:
         async def execute_buy(self, **kwargs) -> None:
             buy_calls.append((kwargs["symbol"], kwargs["price"], kwargs["ts_ms"]))
@@ -469,19 +259,14 @@ async def test_swing_strategy_uses_retail_flow_entry_logic() -> None:
         async def execute_sell(self, **kwargs) -> None:
             raise AssertionError("unexpected sell")
 
-        async def execute_short(self, **kwargs) -> None:
-            raise AssertionError("unexpected short")
-
-        async def execute_cover(self, **kwargs) -> None:
-            raise AssertionError("unexpected cover")
-
+    buy_calls: list[tuple[str, float, int]] = []
     trader._send = types.MethodType(_noop, trader)
     trader._persist_trade = types.MethodType(_noop, trader)
     trader._execution = _FakeExecution()
     trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
     trader._calc_atr = types.MethodType(lambda self, symbol: 1.5, trader)
 
-    base_ts = int(__import__("datetime").datetime(2026, 4, 21, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
+    base_ts = int(dt.datetime(2026, 4, 21, 9, 1, tzinfo=dt.timezone(dt.timedelta(hours=8))).timestamp() * 1000)
     for i, price in enumerate([100.0, 100.5, 101.0, 101.5, 102.0, 102.5, 103.0, 103.5, 104.0, 104.5, 105.0]):
         await trader.on_tick(
             {
@@ -496,8 +281,8 @@ async def test_swing_strategy_uses_retail_flow_entry_logic() -> None:
             }
         )
 
-    assert strategy.classify_calls, "expected retail flow strategy to classify watch state"
-    assert buy_calls, "expected retail flow swing mode to enter via _paper_buy"
+    assert strategy.classify_calls
+    assert buy_calls
     assert trader._swing_runtime.watch_states["2330"] == "entered"
 
 
@@ -537,11 +322,6 @@ async def test_swing_strategy_only_buys_once_when_state_stays_ready() -> None:
         institutional_flow_cache=cache,
     )
 
-    async def _noop(*args, **kwargs) -> None:
-        return None
-
-    buy_calls: list[tuple[str, float, int]] = []
-
     class _FakeExecution:
         async def execute_buy(self, **kwargs) -> None:
             buy_calls.append((kwargs["symbol"], kwargs["price"], kwargs["ts_ms"]))
@@ -549,19 +329,14 @@ async def test_swing_strategy_only_buys_once_when_state_stays_ready() -> None:
         async def execute_sell(self, **kwargs) -> None:
             raise AssertionError("unexpected sell")
 
-        async def execute_short(self, **kwargs) -> None:
-            raise AssertionError("unexpected short")
-
-        async def execute_cover(self, **kwargs) -> None:
-            raise AssertionError("unexpected cover")
-
+    buy_calls: list[tuple[str, float, int]] = []
     trader._send = types.MethodType(_noop, trader)
     trader._persist_trade = types.MethodType(_noop, trader)
     trader._execution = _FakeExecution()
     trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
     trader._calc_atr = types.MethodType(lambda self, symbol: 1.5, trader)
 
-    base_ts = int(__import__("datetime").datetime(2026, 4, 21, 9, 1, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
+    base_ts = int(dt.datetime(2026, 4, 21, 9, 1, tzinfo=dt.timezone(dt.timedelta(hours=8))).timestamp() * 1000)
     for i, price in enumerate([100.0, 100.5, 101.0, 101.5, 102.0, 102.5, 103.0, 103.5, 104.0, 104.5, 105.0, 105.5]):
         await trader.on_tick(
             {
@@ -578,5 +353,3 @@ async def test_swing_strategy_only_buys_once_when_state_stays_ready() -> None:
 
     assert len(buy_calls) == 1
     assert trader._swing_runtime.watch_states["2330"] == "entered"
-
-

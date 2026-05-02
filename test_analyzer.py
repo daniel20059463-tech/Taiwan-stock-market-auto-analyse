@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 import time
+import sys
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 
+import analyzer
 from analyzer import AnalyzerService, analyze_news_text, fake_nlp_analyze
+
+
+def test_analyzer_service_uses_current_interpreter_for_spawn(monkeypatch) -> None:
+    recorded: list[str] = []
+
+    class _FakeContext:
+        def Queue(self, maxsize=None):
+            return []
+
+    monkeypatch.setattr(analyzer, "set_executable", lambda path: recorded.append(path))
+    monkeypatch.setattr(analyzer, "get_context", lambda method: _FakeContext())
+
+    service = AnalyzerService(num_workers=1)
+
+    assert service._ctx is not None
+    assert recorded == [sys.executable]
 
 
 def assert_shm_absent(shm_name: str) -> None:

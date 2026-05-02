@@ -114,6 +114,8 @@ class DailyReporter:
         self.highlight_count = highlight_count
 
     def build_and_send(self, *, day_payload: dict[str, Any]) -> DailyReportDelivery:
+        if str(day_payload.get("source", "")).strip() != "runtime_eod":
+            raise RuntimeError("daily_report_invalid_source")
         highlights = self.select_highlight_trades(day_payload.get("trades", []))
         highlight_summaries: list[str] = []
         used_fallback = False
@@ -132,7 +134,7 @@ class DailyReporter:
 
         report_text = self._merge_with_highlights(report_text, highlight_summaries, day_payload)
         report_text = self.clamp_telegram_text(report_text)
-        self.telegram_sender(chat_id=self.chat_id, text=report_text, parse_mode="Markdown")
+        self.telegram_sender(chat_id=self.chat_id, text=report_text, parse_mode="")
         return DailyReportDelivery(
             text=report_text,
             used_fallback=used_fallback,
@@ -186,6 +188,7 @@ class DailyReporter:
             "totalPnl": float(day_payload.get("totalPnl", 0.0) or 0.0),
             "riskStatus": dict(day_payload.get("riskStatus") or {}),
             "highlights": list(highlights),
+            "newPositions": list(day_payload.get("newPositions") or []),
         }
 
     def build_fallback_report(
@@ -208,6 +211,17 @@ class DailyReporter:
             f"總損益：{total_pnl:+,.0f}",
             f"風控狀態：{risk_label}",
         ]
+        new_positions = day_payload.get("newPositions") or []
+        if new_positions:
+            lines.append("今日新倉")
+            for pos in new_positions:
+                symbol = pos.get("symbol", "--")
+                price = float(pos.get("price", 0.0) or 0.0)
+                shares = int(pos.get("shares", 0) or 0)
+                lots = shares // 1000
+                stop = pos.get("stopPrice")
+                stop_str = f"，停損 {stop:,.2f}" if stop else ""
+                lines.append(f"- {symbol} 買入 {price:,.2f} 元 {lots} 張{stop_str}")
         if highlights:
             lines.append("重點交易")
             for trade in highlights:
@@ -245,13 +259,15 @@ class DailyReporter:
 
 def telegram_sender_from_env(*, bot_token: str, timeout_seconds: float = 10.0) -> Callable[..., None]:
     def _send(*, chat_id: int, text: str, parse_mode: str) -> None:
-        payload = {
+        payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": parse_mode,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         import time
 
+        last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
                 request = urllib.request.Request(
@@ -260,11 +276,19 @@ def telegram_sender_from_env(*, bot_token: str, timeout_seconds: float = 10.0) -
                     headers={"Content-Type": "application/json"},
                     data=json.dumps(payload).encode("utf-8"),
                 )
-                with urllib.request.urlopen(request, timeout=timeout_seconds):
-                    break
-            except (urllib.error.URLError, TimeoutError):
+                with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                if not body.get("ok"):
+                    raise RuntimeError(f"telegram_api_error:{body.get('description', 'unknown_error')}")
+                return
+            except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
+                last_error = exc
                 if attempt < 3:
                     time.sleep(2 ** (attempt - 1))
+                    continue
+                raise RuntimeError(f"telegram_send_failed:{exc}") from exc
+        if last_error is not None:
+            raise RuntimeError(f"telegram_send_failed:{last_error}") from last_error
 
     return _send
 

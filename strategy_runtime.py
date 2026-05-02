@@ -10,6 +10,7 @@ from market_calendar import is_known_open_trading_date
 
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 logger = logging.getLogger("run")
+SUPPORTED_STRATEGY_MODE = "retail_flow_swing"
 
 
 def _today_trade_date() -> str:
@@ -17,6 +18,15 @@ def _today_trade_date() -> str:
 
 
 FLOW_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "flow_cache.json")
+
+
+def normalize_strategy_mode(strategy_mode: str) -> str:
+    normalized = (strategy_mode or "").strip() or SUPPORTED_STRATEGY_MODE
+    if normalized != SUPPORTED_STRATEGY_MODE:
+        raise ValueError(
+            f"Unsupported STRATEGY_MODE: {normalized}. Only {SUPPORTED_STRATEGY_MODE} is supported."
+        )
+    return normalized
 
 
 def _previous_known_open_trading_date(date_str: str) -> str:
@@ -41,16 +51,16 @@ def resolve_flow_cache_trade_date(
 
 
 def build_strategy_dependencies(strategy_mode: str) -> dict[str, Any]:
+    normalized_strategy_mode = normalize_strategy_mode(strategy_mode)
     provider_module = importlib.import_module("institutional_flow_provider")
     cache_module = importlib.import_module("institutional_flow_cache")
     base: dict[str, Any] = {
         "institutional_flow_provider": provider_module.InstitutionalFlowProvider(),
         "institutional_flow_cache": cache_module.InstitutionalFlowCache(),
-        "strategy_mode": strategy_mode,
+        "strategy_mode": normalized_strategy_mode,
     }
-    if strategy_mode == "retail_flow_swing":
-        strategy_module = importlib.import_module("retail_flow_strategy")
-        base["retail_flow_strategy"] = strategy_module.RetailFlowSwingStrategy()
+    strategy_module = importlib.import_module("retail_flow_strategy")
+    base["retail_flow_strategy"] = strategy_module.RetailFlowSwingStrategy()
     return base
 
 

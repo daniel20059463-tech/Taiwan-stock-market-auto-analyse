@@ -10,7 +10,7 @@ Usage:
     from institutional_flow_provider import InstitutionalFlowRow
 
     def make_trader():
-        return AutoTrader(telegram_token="", chat_id="", strategy_mode="intraday")
+        return AutoTrader(telegram_token="", chat_id="", strategy_mode="retail_flow_swing")
 
     runner = BacktestRunner(auto_trader_factory=make_trader)
     result = await runner.run(bars=my_bars, flow_rows_by_date={})
@@ -58,7 +58,7 @@ class BacktestRunner:
     Replays historical bars through an AutoTrader and collects results.
 
     Each bar is expanded into 3 synthetic ticks (open, mid, close) so the
-    trader's intraday logic can trigger both entries and exits within a bar.
+    trader's current swing logic can evaluate both entries and exits within a bar.
     """
 
     def __init__(self, *, auto_trader_factory: Callable[[], Any]) -> None:
@@ -69,6 +69,7 @@ class BacktestRunner:
         bars: list[BacktestBar],
         flow_rows_by_date: dict[str, list] | None = None,
         daily_price_cache: Any = None,
+        market_index_by_date: dict[str, float] | None = None,
     ) -> BacktestResult:
         """
         Run the backtest.
@@ -81,6 +82,9 @@ class BacktestRunner:
             daily_price_cache: Optional DailyPriceCache instance. When provided,
                 injected into the trader so ATR/MA/RSI calculations match live
                 behaviour instead of falling back to the mid-stop default.
+            market_index_by_date: Optional dict mapping date strings to TAIEX
+                daily change_pct. Injected via update_market_index() before each
+                day's bars so the market-strength entry filter applies in backtest.
         """
         trader = self._factory()
 
@@ -94,9 +98,21 @@ class BacktestRunner:
             trader.set_daily_price_cache(daily_price_cache)
 
         sorted_bars = sorted(bars, key=lambda b: b.ts_ms)
+
+        # Group by date so we can inject TAIEX market_change_pct before each day's ticks.
+        bars_by_date: dict[str, list] = {}
         for bar in sorted_bars:
-            for tick in _bar_to_ticks(bar):
-                await trader.on_tick(tick)
+            dt = datetime.datetime.fromtimestamp(bar.ts_ms / 1000, tz=_TZ_TW)
+            date = dt.strftime("%Y-%m-%d")
+            bars_by_date.setdefault(date, []).append(bar)
+
+        for date in sorted(bars_by_date.keys()):
+            if market_index_by_date and date in market_index_by_date:
+                if hasattr(trader, "update_market_index"):
+                    trader.update_market_index(market_index_by_date[date])
+            for bar in bars_by_date[date]:
+                for tick in _bar_to_ticks(bar):
+                    await trader.on_tick(tick)
 
         initial_equity = float(
             getattr(getattr(trader, "_risk", None), "account_capital", 1_000_000.0)

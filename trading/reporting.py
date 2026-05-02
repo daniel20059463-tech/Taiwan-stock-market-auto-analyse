@@ -25,6 +25,7 @@ def build_daily_report_payload(
     report_date = _ts_to_date(ts_ms)
     trades = [t for t in trade_history if _ts_to_date(t.ts) == report_date]
     closed_trades = [t for t in trades if t.action in {"SELL", "COVER"}]
+    new_positions = [t for t in trades if t.action in {"BUY", "SHORT"}]
     realized_pnl = sum(t.pnl for t in closed_trades)
     wins = sum(1 for t in closed_trades if t.pnl > 0)
     win_rate = wins / len(closed_trades) * 100 if closed_trades else 0.0
@@ -37,6 +38,7 @@ def build_daily_report_payload(
         for sym, pos in positions.items()
     )
     return {
+        "source": "runtime_eod",
         "date": report_date,
         "tradeCount": len(closed_trades),
         "winRate": round(win_rate, 1),
@@ -44,6 +46,17 @@ def build_daily_report_payload(
         "unrealizedPnl": round(unrealized_pnl, 0),
         "totalPnl": round(realized_pnl + unrealized_pnl, 0),
         "riskStatus": risk.status_dict(),
+        "newPositions": [
+            {
+                "symbol": t.symbol,
+                "action": t.action,
+                "price": round(t.price, 2),
+                "shares": t.shares,
+                "stopPrice": round(t.stop_price, 2) if t.stop_price else None,
+                "ts": t.ts,
+            }
+            for t in new_positions
+        ],
         "trades": [
             {
                 "symbol": t.symbol,

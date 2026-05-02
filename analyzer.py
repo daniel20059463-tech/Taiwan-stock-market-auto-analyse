@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from multiprocessing import get_context, resource_tracker
+from multiprocessing import get_context, resource_tracker, set_executable
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
 from multiprocessing.shared_memory import SharedMemory
@@ -230,6 +231,7 @@ def worker_main(task_queue: Queue, result_queue: Queue, ready_queue: Queue | Non
 
 class AnalyzerService:
     def __init__(self, *, num_workers: int = 1, queue_size: int = 1024) -> None:
+        set_executable(sys.executable)
         self._ctx = get_context("spawn")
         self.num_workers = num_workers
         self.task_queue: Queue = self._ctx.Queue(maxsize=queue_size)

@@ -2,16 +2,61 @@ from __future__ import annotations
 
 from institutional_flow_provider import InstitutionalFlowRow
 
+TRUST_FLOW_INTENSITY_FULL_SCALE = 0.01
+FOREIGN_FLOW_INTENSITY_FULL_SCALE = 0.01
+MAJOR_FLOW_INTENSITY_FULL_SCALE = 0.008
+MIN_ENTRY_FLOW_SCORE = 0.55
+
 
 def _positive_score(value: int) -> float:
     return 1.0 if value > 0 else 0.0
 
 
+def _scaled_positive_intensity(
+    value: int,
+    avg_daily_volume_20d: float | None,
+    *,
+    full_scale_ratio: float,
+) -> float:
+    if value <= 0:
+        return 0.0
+    if avg_daily_volume_20d is None or avg_daily_volume_20d <= 0:
+        return _positive_score(value)
+    intensity = value / avg_daily_volume_20d
+    return max(0.0, min(intensity / full_scale_ratio, 1.0))
+
+
+def _margin_signal(margin_net_change: int) -> float:
+    """Contrarian retail signal.
+
+    Margin decrease (retail exiting) → institutions holding → mild positive.
+    Margin surge (retail chasing) → crowded trade → mild negative.
+    """
+    if margin_net_change < 0:
+        return 0.05
+    if margin_net_change > 0:
+        return -0.05
+    return 0.0
+
+
 def compute_flow_score(row: InstitutionalFlowRow) -> float:
-    trust = _positive_score(row.investment_trust_net_buy) * 0.55
-    foreign = _positive_score(row.foreign_net_buy) * 0.45
-    major = _positive_score(row.major_net_buy) * 0.0
-    return round(trust + foreign + major, 2)
+    trust = _scaled_positive_intensity(
+        row.investment_trust_net_buy,
+        row.avg_daily_volume_20d,
+        full_scale_ratio=TRUST_FLOW_INTENSITY_FULL_SCALE,
+    ) * 0.45
+    foreign = _scaled_positive_intensity(
+        row.foreign_net_buy,
+        row.avg_daily_volume_20d,
+        full_scale_ratio=FOREIGN_FLOW_INTENSITY_FULL_SCALE,
+    ) * 0.35
+    major = _scaled_positive_intensity(
+        row.major_net_buy,
+        row.avg_daily_volume_20d,
+        full_scale_ratio=MAJOR_FLOW_INTENSITY_FULL_SCALE,
+    ) * 0.20
+    margin = _margin_signal(row.margin_net_change)
+    return round(trust + foreign + major + margin, 2)
 
 
 def classify_watch_state(
@@ -24,8 +69,10 @@ def classify_watch_state(
 ) -> str:
     if flow_score <= 0:
         return "skip"
-    if recent_runup_pct >= 10.0:
+    if recent_runup_pct >= 15.0:
         return "skip"
+    if flow_score < MIN_ENTRY_FLOW_SCORE:
+        return "watch"
     if consecutive_trust_days < 2:
         return "watch"
     if above_ma10 and volume_confirmed:

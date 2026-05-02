@@ -1,14 +1,16 @@
 """
 Paper-trading engine for the Taiwan stock simulation system.
 
-The module consumes normalized tick payloads, maintains intraday bars,
-evaluates buy and exit conditions, enforces risk controls, and publishes
-portfolio summaries through Telegram.
+The module consumes normalized tick payloads, maintains live bar state for
+the active session, evaluates the retail-flow swing strategy, enforces risk
+controls, and publishes portfolio summaries through Telegram.
 """
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import datetime
+import json
 import logging
 import math
 import os
@@ -45,8 +47,6 @@ logger = logging.getLogger(__name__)
 # Signal thresholds
 BUY_SIGNAL_PCT = 2.0
 OPENING_BREAKOUT_PCT = 1.0   # Lower threshold for the 09:00–09:30 opening window
-SHORT_SIGNAL_PCT = -1.5      # Minimum drop required to trigger short evaluation
-SHORT_SENTIMENT_THRESHOLD = -0.25  # Sentiment must be below this to allow shorting
 NEAR_LIMIT_UP_PCT = 9.5
 LIMIT_LOCK_UP_PCT = 9.5    # 漲停鎖死判定門檻
 LIMIT_LOCK_DOWN_PCT = -9.5 # 跌停鎖死判定門檻
@@ -56,6 +56,13 @@ EX_DIVIDEND_GAP_PCT = 3.0  # open vs previousClose 缺口超過此值且大盤�
 
 # Slippage simulation
 SLIPPAGE_BPS = 5  # 5 bps = 0.05% 的單邊滑價
+LIQUIDITY_SLIPPAGE_TIERS = (
+    (500_000_000.0, 5),
+    (100_000_000.0, 10),
+    (0.0, 20),
+)
+ORDER_PRESSURE_LIMIT = 0.05
+ORDER_PRESSURE_PENALTY_BPS = 10
 NEAR_HIGH_RATIO = 0.90
 VOLUME_CONFIRM_MULT = 1.5
 ATR_BARS_NEEDED = 5
@@ -68,10 +75,18 @@ MARKET_HALT_PCT = -1.5
 TRAIL_STOP_ATR_MULT = 2.0
 TRAIL_STOP_FALLBACK = 3.0
 
+MIN_AVG_DAILY_VALUE_20D = 100_000_000.0
+MARKET_REGIME_BLOCK_PCT = -1.5
+MAX_SECTOR_CAPITAL_PCT = 25.0
+MARKET_RS_SYMBOL = "TAIEX"
+
 # Entry quality filters
 RSI_OVERBOUGHT = 75.0          # RSI 超買門檻，高於此值不進多方
-MAX_SECTOR_POSITIONS = 2       # 同一類股最多同時持有的部位數
+MAX_SECTOR_POSITIONS = 5       # 同一類股最多同時持有的部位數
 PREOPEN_WATCHLIST_THRESHOLD = 0.5  # 籌碼確認標的的盤中進場門檻（低於一般動能觸發）
+
+_EXCLUDED_BUY_SECTOR_CODES = {"17"}
+_EXCLUDED_BUY_SECTOR_KEYWORDS = ("金融", "保險", "銀行", "證券", "期貨", "金控")
 
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -94,11 +109,13 @@ class AutoTrader:
         eod_report_delay_seconds: float = 180.0,
         strategy_tuner: Any = None,
         disposition_filter: Any = None,
-        strategy_mode: str = "intraday",
+        strategy_mode: str = "retail_flow_swing",
         retail_flow_strategy: RetailFlowSwingStrategy | None = None,
         institutional_flow_cache: Any = None,
         daily_price_cache: Any = None,
         daily_price_cache_path: str | None = None,
+        local_positions_path: str | None = None,
+        slippage_multiplier: float = 1.0,
     ) -> None:
         self._token = telegram_token
         self._chat_id = chat_id
@@ -124,6 +141,12 @@ class AutoTrader:
         self._institutional_flow_cache = institutional_flow_cache
         self._daily_price_cache = daily_price_cache
         self._daily_price_cache_path = daily_price_cache_path
+        self._local_positions_path = local_positions_path or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "data",
+            "paper_positions.json",
+        )
+        self._slippage_multiplier = max(0.0, float(slippage_multiplier))
         self._daily_closes_recorded = False  # reset each day
 
         # Runtime state
@@ -152,7 +175,8 @@ class AutoTrader:
         from swing_exit_judge import swing_exit_judge_from_env
         self._swing_judge = swing_exit_judge_from_env()
 
-        # Intraday 1-minute bars live in MarketState.
+        # Live 1-minute bars are stored in MarketState and reused by the
+        # current swing entry / exit logic.
         self._current_bar = self._market.current_bar
         self._candle_history = self._market.bar_history
         self._volume_history = self._market.volume_history
@@ -175,18 +199,19 @@ class AutoTrader:
         self._execution = PaperExecutionService(
             buy_executor=self._paper_buy,
             sell_executor=self._paper_sell,
-            short_executor=self._paper_short,
-            cover_executor=self._paper_cover,
         )
 
         # Pre-open watchlist: stocks with consecutive institutional buying
         self._preopen_watchlist: set[str] = set()
         self._swing_runtime = SwingRuntimeCoordinator()
         self._retail_flow_non_entry_reasons: dict[str, str] = {}
+        self._sector_signal_cache: Any = None
 
         # Sector rotation: cached today's hot/cold sector flow + alert dedup
         self._sector_flows_today: dict[str, Any] = {}   # sector -> SectorFlowSnapshot
         self._rotation_alerted_date: str = ""
+
+        self._build_preopen_watchlist()
 
     async def on_tick(self, payload: dict[str, Any]) -> None:
         if self._monitor_task is None:
@@ -238,40 +263,10 @@ class AutoTrader:
                 self._last_report_ts = time.time()
             return
 
-        if not _is_trading_hours(ts_ms):
-            return
-
-        # ⑥ EOD 自動平倉（13:25 後）
-        if self._strategy_mode == "intraday" and _is_eod_close_time(ts_ms) and not self._eod_closed:
-            await self._close_all_eod(ts_ms)
-            self._eod_closed = True
-            return
-
-        # ⑦ 持倉出場檢查（動態停損/停利）
-        position = self._book.positions.get(symbol)
-        if position is not None and position.side == "long":
-            await self._check_exit(symbol, price, ts_ms)
-        elif position is not None and position.side == "short":
-            await self._check_short_exit(symbol, price, ts_ms)
-        else:
-            # 無持倉：評估多方進場
-            # 籌碼確認標的（連續投信買超）使用較低門檻，其他維持原門檻
-            in_watchlist = symbol in self._preopen_watchlist
-            effective_threshold = (
-                PREOPEN_WATCHLIST_THRESHOLD if in_watchlist
-                else OPENING_BREAKOUT_PCT if _is_opening_breakout_window(ts_ms)
-                else self._buy_signal_pct
-            )
-            if change_pct >= effective_threshold:
-                await self._evaluate_buy(symbol, price, change_pct, ts_ms, payload)
-            # 評估空方進場（與多方互斥，同一標的只能一個方向）
-            if symbol not in self._book.positions:
-                await self._evaluate_short(symbol, price, change_pct, ts_ms, payload)
-
-        # ⑧ 定時績效報告
-        if time.time() - self._last_report_ts >= self._report_interval:
-            await self._send_performance_report()
-            self._last_report_ts = time.time()
+        raise RuntimeError(
+            f"Unsupported strategy_mode at runtime: {self._strategy_mode}. "
+            "Only retail_flow_swing is supported."
+        )
 
     # ── 大盤方向更新（由外部 tick 流呼叫）────────────────────────────────────
 
@@ -288,6 +283,9 @@ class AutoTrader:
         self._daily_price_cache = cache
         if path is not None:
             self._daily_price_cache_path = path
+
+    def set_sector_signal_cache(self, cache: Any) -> None:
+        self._sector_signal_cache = cache
 
     def _maybe_reset_day(self, ts_ms: int) -> None:
         date_str = _ts_to_date(ts_ms)
@@ -320,8 +318,10 @@ class AutoTrader:
         position = self._book.positions.get(symbol)
         if position is None:
             return
+        if position.side != "long":
+            return
 
-        if position.side == "long" and open_price < position.stop_price:
+        if open_price < position.stop_price:
             gap_pct = (open_price - position.entry_price) / position.entry_price * 100
             logger.warning(
                 "%s overnight gap-down: open=%.2f stop=%.2f entry=%.2f (%.2f%%)",
@@ -333,25 +333,6 @@ class AutoTrader:
                 f"以開盤價強制平倉，損益 {gap_pct:+.2f}%"
             )
             await self._execution.execute_sell(
-                symbol=symbol,
-                price=open_price,
-                reason="STOP_LOSS",
-                pct_from_entry=gap_pct,
-                ts_ms=ts_ms,
-            )
-
-        elif position.side == "short" and open_price > position.stop_price:
-            gap_pct = (position.entry_price - open_price) / position.entry_price * 100
-            logger.warning(
-                "%s overnight gap-up: open=%.2f stop=%.2f entry=%.2f (%.2f%%)",
-                symbol, open_price, position.stop_price, position.entry_price, gap_pct,
-            )
-            await self._send(
-                f"[跳空警示] {symbol} 開盤跳空突破空方停損\n"
-                f"開盤價 {open_price:.2f}（停損 {position.stop_price:.2f}，進場 {position.entry_price:.2f}）\n"
-                f"以開盤價強制回補，損益 {gap_pct:+.2f}%"
-            )
-            await self._execution.execute_cover(
                 symbol=symbol,
                 price=open_price,
                 reason="STOP_LOSS",
@@ -457,6 +438,121 @@ class AutoTrader:
         current_trade_date = self._current_date or datetime.datetime.now(tz=_TZ_TW).strftime("%Y-%m-%d")
         return _previous_known_open_trading_date(current_trade_date)
 
+    def _average_daily_volume_20d(self, symbol: str) -> float | None:
+        if self._daily_price_cache is None:
+            return None
+        return self._daily_price_cache.average_volume(
+            symbol,
+            period=20,
+            as_of_date=self._prev_trade_date(),
+        )
+
+    def _average_daily_value_20d(self, symbol: str) -> float | None:
+        if self._daily_price_cache is None:
+            return None
+        return self._daily_price_cache.average_value(
+            symbol,
+            period=20,
+            as_of_date=self._prev_trade_date(),
+        )
+
+    def _latest_bar_notional(self, symbol: str) -> float | None:
+        current_bar = self._market.latest_bar(symbol)
+        if current_bar is None:
+            return None
+        close_price = float(getattr(current_bar, "close", 0.0) or 0.0)
+        volume = float(getattr(current_bar, "volume", 0) or 0.0)
+        if close_price <= 0 or volume <= 0:
+            return None
+        return close_price * volume
+
+    def _resolve_slippage_bps(self, symbol: str, *, price: float, shares: int) -> int:
+        avg_daily_value = self._average_daily_value_20d(symbol) or 0.0
+        resolved = SLIPPAGE_BPS
+        for min_value, bps in LIQUIDITY_SLIPPAGE_TIERS:
+            if avg_daily_value >= min_value:
+                resolved = bps
+                break
+
+        latest_bar_notional = self._latest_bar_notional(symbol)
+        order_notional = price * shares
+        if latest_bar_notional and latest_bar_notional > 0:
+            if order_notional / latest_bar_notional > ORDER_PRESSURE_LIMIT:
+                resolved += ORDER_PRESSURE_PENALTY_BPS
+        return max(0, int(round(resolved * getattr(self, "_slippage_multiplier", 1.0))))
+
+    def _passes_market_regime(self) -> bool:
+        return self._market_change_pct > MARKET_REGIME_BLOCK_PCT
+
+    def _passes_liquidity_filter(self, symbol: str) -> bool:
+        avg_daily_value = self._average_daily_value_20d(symbol)
+        if avg_daily_value is None:
+            return True
+        return avg_daily_value >= MIN_AVG_DAILY_VALUE_20D
+
+    def _sector_position_count(self, sector: str) -> int:
+        return sum(1 for value in self._position_sectors.values() if value == sector)
+
+    def _sector_capital_used(self, sector: str) -> float:
+        total = 0.0
+        for symbol, position in self._book.positions.items():
+            if self._position_sectors.get(symbol) != sector:
+                continue
+            total += float(position.entry_price) * float(position.shares)
+        return total
+
+    def _passes_sector_limits(self, sector: str, *, pending_notional: float) -> tuple[bool, str]:
+        if not sector:
+            return True, "OK"
+        if self._sector_position_count(sector) >= MAX_SECTOR_POSITIONS:
+            return False, "sector_position_limit"
+        account_capital = float(getattr(self._risk, "account_capital", 1_000_000.0))
+        sector_cap = account_capital * MAX_SECTOR_CAPITAL_PCT / 100
+        if self._sector_capital_used(sector) + pending_notional > sector_cap:
+            return False, "sector_capital_limit"
+        return True, "OK"
+
+    def _window_return_pct(self, symbol: str, days: int) -> float | None:
+        if self._daily_price_cache is None:
+            return None
+        bars = self._daily_price_cache.get_bars(
+            symbol,
+            as_of_date=self._prev_trade_date(),
+            n=days + 1,
+        )
+        if len(bars) < days + 1:
+            return None
+        start_close = float(bars[0].close)
+        end_close = float(bars[-1].close)
+        if start_close <= 0:
+            return None
+        return (end_close - start_close) / start_close * 100
+
+    def _relative_strength(self, symbol: str, days: int) -> float | None:
+        stock_ret = self._window_return_pct(symbol, days)
+        market_ret = self._window_return_pct(MARKET_RS_SYMBOL, days)
+        if stock_ret is None or market_ret is None:
+            return None
+        return stock_ret - market_ret
+
+    def _passes_relative_strength_filter(self, symbol: str) -> bool:
+        rs20 = self._relative_strength(symbol, 20)
+        rs60 = self._relative_strength(symbol, 60)
+        if rs20 is None or rs60 is None:
+            return True
+        return rs20 > 0 and rs60 > 0
+
+    def _get_sector_state(self, sector: str, trade_date: str | None = None) -> str | None:
+        if not sector or self._sector_signal_cache is None:
+            return None
+        lookup_date = trade_date or self._swing_trade_date()
+        record = self._sector_signal_cache.get(lookup_date, sector)
+        if record is None:
+            latest_date = getattr(self._sector_signal_cache, "latest_trade_date", lambda: None)()
+            if latest_date:
+                record = self._sector_signal_cache.get(latest_date, sector)
+        return None if record is None else record.state
+
     def get_retail_flow_watch_state(self, symbol: str) -> str | None:
         return self._swing_runtime.watch_states.get(symbol)
 
@@ -471,11 +567,25 @@ class AutoTrader:
     def get_retail_flow_watchlist(self) -> list[str]:
         return sorted(self._preopen_watchlist)
 
+    def get_required_symbols(self) -> list[str]:
+        """Return symbols the bridge must subscribe to: watchlist + open positions."""
+        symbols = set(self._preopen_watchlist)
+        symbols.update(self._book.positions.keys())
+        return sorted(symbols)
+
     def _set_retail_flow_non_entry_reason(self, symbol: str, reason: str) -> None:
         self._retail_flow_non_entry_reasons[symbol] = reason
 
     def _clear_retail_flow_non_entry_reason(self, symbol: str) -> None:
         self._retail_flow_non_entry_reasons.pop(symbol, None)
+
+    def _is_financial_sector(self, sector: str) -> bool:
+        normalized = str(sector or "").strip()
+        if not normalized:
+            return False
+        if normalized in _EXCLUDED_BUY_SECTOR_CODES:
+            return True
+        return any(keyword in normalized for keyword in _EXCLUDED_BUY_SECTOR_KEYWORDS)
 
     def _build_preopen_watchlist(self) -> None:
         """每日換日時建立今日籌碼確認標的清單，讓這些股票以較低門檻進場。"""
@@ -584,6 +694,30 @@ class AutoTrader:
         yesterday = self._prev_trade_date()
         return self._daily_price_cache.rsi(symbol, period, as_of_date=yesterday)
 
+    def _ma10_gap_pct(self, symbol: str, price: float) -> float | None:
+        ma10 = self._daily_ma(symbol, 10)
+        if ma10 is None or ma10 <= 0:
+            return None
+        return (price - ma10) / ma10 * 100
+
+    def _consecutive_weak_flow_days(self, symbol: str, as_of_date: str, n: int = 3) -> int:
+        if self._institutional_flow_cache is None or self._retail_flow_strategy is None:
+            return 0
+        dates = sorted(
+            [d for d in self._institutional_flow_cache.available_dates() if d <= as_of_date],
+            reverse=True,
+        )[:n]
+        count = 0
+        for date_str in dates:
+            row = self._institutional_flow_cache.get(date_str, symbol)
+            if row is None:
+                break
+            score = self._retail_flow_strategy.compute_flow_score(row)
+            if score > 0:
+                break
+            count += 1
+        return count
+
     def _prev_trade_date(self) -> str:
         """回傳前一個交易日日期字串（用於日線指標，因今日未收盤）。"""
         current_trade_date = self._current_date or datetime.datetime.now(tz=_TZ_TW).strftime("%Y-%m-%d")
@@ -649,14 +783,32 @@ class AutoTrader:
         ts_ms: int,
         payload: dict[str, Any],
     ) -> None:
+        sector = self._symbol_sectors.get(symbol) or str(payload.get("sector", "")).strip()
+        if self._is_financial_sector(sector):
+            self._set_retail_flow_non_entry_reason(symbol, "financial_sector")
+            logger.info("Skip retail_flow_swing entry for %s: excluded sector=%s", symbol, sector)
+            return
+
         if self._institutional_flow_cache is None or self._retail_flow_strategy is None:
             self._set_retail_flow_non_entry_reason(symbol, "strategy_unavailable")
             return
 
-        # 波段進場在整個交易時段（09:00–13:30）皆可進場
+        sector_state = self._get_sector_state(sector)
+        if sector_state in {"watch", "weakening", "exit"}:
+            self._set_retail_flow_non_entry_reason(symbol, f"sector_state_{sector_state}")
+            return
+
+        if not self._passes_market_regime():
+            self._set_retail_flow_non_entry_reason(symbol, "market_regime_blocked")
+            return
+
+        if not self._passes_liquidity_filter(symbol):
+            self._set_retail_flow_non_entry_reason(symbol, "liquidity_below_threshold")
+            return
+
         # 籌碼資料是前一日的（T+1 延遲），以 _swing_trade_date() 取前一交易日
-        if not _is_swing_entry_window(ts_ms):
-            self._set_retail_flow_non_entry_reason(symbol, "outside_entry_window")
+        if not self._passes_relative_strength_filter(symbol):
+            self._set_retail_flow_non_entry_reason(symbol, "relative_strength_weak")
             return
 
         flow_row = self._institutional_flow_cache.get(self._swing_trade_date(), symbol)
@@ -664,16 +816,27 @@ class AutoTrader:
             self._set_retail_flow_non_entry_reason(symbol, "flow_row_missing")
             return
 
+        avg_daily_volume = self._average_daily_volume_20d(symbol)
+        avg_daily_value = self._average_daily_value_20d(symbol)
+        if avg_daily_volume is not None or avg_daily_value is not None:
+            flow_row = replace(
+                flow_row,
+                avg_daily_volume_20d=avg_daily_volume,
+                avg_daily_value_20d=avg_daily_value,
+            )
+
         flow_score = self._retail_flow_strategy.compute_flow_score(flow_row)
         consecutive_days = self._institutional_flow_cache.consecutive_trust_buy_days(
             symbol, self._swing_trade_date(), n=5
         )
+        recent_5d_return = self._window_return_pct(symbol, 5)
+        recent_runup_pct = recent_5d_return if recent_5d_return is not None else change_pct
         watch_state = self._swing_runtime.classify_entry_state(
             symbol=symbol,
             flow_score=flow_score,
             above_ma10=self._is_above_ma10(symbol, price),
             volume_confirmed=self._is_volume_confirmed(symbol),
-            recent_runup_pct=change_pct,
+            recent_runup_pct=recent_runup_pct,
             consecutive_trust_days=consecutive_days,
             classifier=self._retail_flow_strategy.classify_watch_state,
         )
@@ -687,6 +850,10 @@ class AutoTrader:
         atr = self._daily_atr(symbol)
         stop_price = self._risk.calc_stop_price(price, atr)
         shares = self._risk.calc_position_shares(price, stop_price)
+        allowed, reason = self._passes_sector_limits(sector, pending_notional=price * shares)
+        if not allowed:
+            self._set_retail_flow_non_entry_reason(symbol, reason)
+            return
         allowed, _reason = self._risk.can_buy(symbol, price, shares, len(self._book.positions))
         if not allowed:
             self._set_retail_flow_non_entry_reason(symbol, "risk_rejected")
@@ -739,6 +906,7 @@ class AutoTrader:
         flow_score = 0.0
         if flow_row is not None and self._retail_flow_strategy is not None:
             flow_score = self._retail_flow_strategy.compute_flow_score(flow_row)
+        flow_weak_streak = self._consecutive_weak_flow_days(symbol, self._swing_trade_date(), n=3)
 
         holding_days = max(0, int((ts_ms - position.entry_ts) / 86_400_000))
         pct_from_entry = (
@@ -747,6 +915,11 @@ class AutoTrader:
             else 0.0
         )
         sentiment_score = self._sentiment.get_score(symbol) if self._sentiment is not None else None
+        ma10_gap_pct = self._ma10_gap_pct(symbol, price)
+        daily_atr = self._daily_atr(symbol)
+        atr_pct = (daily_atr / price * 100) if (daily_atr and price > 0) else None
+        sector = self._position_sectors.get(symbol) or self._symbol_sectors.get(symbol, "")
+        sector_state = self._get_sector_state(sector)
 
         judgment = await self._swing_judge.judge(
             symbol=symbol,
@@ -756,9 +929,13 @@ class AutoTrader:
             unrealized_pnl_pct=pct_from_entry,
             above_ma10=self._is_above_ma10(symbol, price),
             flow_score=flow_score,
+            flow_weak_streak=flow_weak_streak,
             sentiment_score=sentiment_score,
             market_change_pct=self._market_change_pct,
             stop_loss_hit=price <= effective_stop,
+            ma10_gap_pct=ma10_gap_pct,
+            atr_pct=atr_pct,
+            sector_state=sector_state,
         )
 
         if judgment.action != "exit":
@@ -769,6 +946,7 @@ class AutoTrader:
             "ma10_break": "MA10_BREAK",
             "flow_weakened": "FLOW_WEAKENED",
             "time_exit": "TIME_EXIT",
+            "sector_exit": "SECTOR_EXIT",
         }
         mapped_reason = reason_map.get(judgment.exit_reason_code or "", "AI_EXIT")
         await self._execution.execute_sell(
@@ -838,16 +1016,12 @@ class AutoTrader:
 
     def _build_portfolio_context(self) -> dict[str, Any]:
         """建立投資組合層級的語境，供 AnalystContext 使用。"""
-        closed_trades = [t for t in self._book.trade_history if t.action in {"SELL", "COVER"}]
+        closed_trades = [t for t in self._book.trade_history if t.action == "SELL"]
         wins = sum(1 for t in closed_trades if t.pnl > 0)
         win_rate = wins / len(closed_trades) if closed_trades else 0.0
         
         unrealized_pnl = sum(
-            (
-                (position.entry_price - self._last_prices.get(symbol, position.entry_price)) * position.shares
-                if position.side == "short"
-                else (self._last_prices.get(symbol, position.entry_price) - position.entry_price) * position.shares
-            )
+            (self._last_prices.get(symbol, position.entry_price) - position.entry_price) * position.shares
             for symbol, position in self._book.positions.items()
         )
         
@@ -990,7 +1164,8 @@ class AutoTrader:
         shares = shares if shares is not None else self._shares
         
         # 模擬買進滑價（買得更貴）
-        execution_price = round(price * (1 + SLIPPAGE_BPS / 10000), 2)
+        slippage_bps = self._resolve_slippage_bps(symbol, price=price, shares=shares)
+        execution_price = round(price * (1 + slippage_bps / 10000), 2)
         
         position = PaperPosition(
             symbol=symbol,
@@ -1053,7 +1228,6 @@ class AutoTrader:
             target_price,
             f"{atr:.4f}" if atr is not None else "N/A",
         )
-        await self._send(text)
 
     async def _check_exit(self, symbol: str, price: float, ts_ms: int) -> None:
         """Check exit conditions for a long position."""
@@ -1208,7 +1382,6 @@ class AutoTrader:
             reason,
             net_pnl,
         )
-        await self._send(text)
 
         if self._risk.is_halted:
             await self._send(
@@ -1513,7 +1686,8 @@ class AutoTrader:
         shares = shares if shares is not None else self._shares
         
         # 模擬放空白價（賣得更便宜）
-        execution_price = round(price * (1 - SLIPPAGE_BPS / 10000), 2)
+        slippage_bps = self._resolve_slippage_bps(symbol, price=price, shares=partial_shares)
+        execution_price = round(price * (1 - slippage_bps / 10000), 2)
         
         position = PaperPosition(
             symbol=symbol,
@@ -1568,7 +1742,6 @@ class AutoTrader:
             "[PAPER SHORT] %s @ %.2f change=%.2f%% stop=%.2f target=%.2f",
             symbol, price, change_pct, stop_price, target_price,
         )
-        await self._send(text)
 
     async def _check_short_exit(self, symbol: str, price: float, ts_ms: int) -> None:
         """檢查空方出場條件（停損 / 停利）。不使用追蹤停利。"""
@@ -1695,7 +1868,6 @@ class AutoTrader:
             "[PAPER COVER] %s @ %.2f reason=%s net_pnl=%.0f",
             symbol, price, reason, net_pnl,
         )
-        await self._send(text)
         if self._risk.just_entered_cooldown:
             await self._send(
                 f"[風控警示] 連續虧損 {self._risk.consecutive_losses + 1} 筆，"
@@ -1774,7 +1946,7 @@ class AutoTrader:
     async def restore_positions(self, trade_date: str) -> int:
         """從資料庫還原當日持倉狀態。"""
         if self._db is None:
-            return 0
+            return self._restore_positions_from_local_snapshot(trade_date)
         try:
             from models import get_session, load_today_positions
             
@@ -1782,6 +1954,8 @@ class AutoTrader:
                 rows = await load_today_positions(session, trade_date=trade_date)
                 
                 for row in rows:
+                    if row["side"] != "long":
+                        continue
                     position = PaperPosition(
                         symbol=row["symbol"],
                         side=row["side"],
@@ -1800,12 +1974,13 @@ class AutoTrader:
                 logger.info("AutoTrader restored %d positions for date %s", len(rows), trade_date)
                 return len(rows)
         except Exception as exc:
-            logger.error("Failed to restore positions: %s", exc)
-            return 0
+            self._handle_persistence_failure(exc, "Failed to restore positions: %s", exc)
+            return self._restore_positions_from_local_snapshot(trade_date)
 
     async def _persist_position_open(self, symbol: str) -> None:
         """Persist a new or modified open position."""
         if self._db is None:
+            self._write_local_positions_snapshot()
             return
         try:
             from models import get_session, upsert_paper_position
@@ -1835,10 +2010,13 @@ class AutoTrader:
                 symbol,
                 exc,
             )
+        finally:
+            self._write_local_positions_snapshot()
 
     async def _persist_position_close(self, symbol: str) -> None:
         """Remove a closed position from persistence."""
         if self._db is None:
+            self._write_local_positions_snapshot()
             return
         try:
             from models import get_session, delete_paper_position
@@ -1855,6 +2033,8 @@ class AutoTrader:
                 symbol,
                 exc,
             )
+        finally:
+            self._write_local_positions_snapshot()
 
     def _position_trade_date(self, ts_ms: int | None = None) -> str:
         if ts_ms is not None:
@@ -1872,6 +2052,74 @@ class AutoTrader:
             self._persistence_disabled_reason = str(exc)
             return
         logger.warning(message, *args)
+
+    def _write_local_positions_snapshot(self) -> None:
+        path = self._local_positions_path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        snapshot_trade_date = self._position_trade_date()
+        if self._book.positions:
+            first_position = next(iter(self._book.positions.values()))
+            snapshot_trade_date = self._position_trade_date(first_position.entry_ts)
+        payload = {
+            "trade_date": snapshot_trade_date,
+            "positions": {
+                symbol: {
+                    "symbol": position.symbol,
+                    "side": position.side,
+                    "entry_price": position.entry_price,
+                    "shares": position.shares,
+                    "entry_ts": position.entry_ts,
+                    "entry_change_pct": position.entry_change_pct,
+                    "stop_price": position.stop_price,
+                    "target_price": position.target_price,
+                    "peak_price": position.peak_price,
+                    "trail_stop_price": position.trail_stop_price,
+                    "entry_atr": position.entry_atr,
+                }
+                for symbol, position in self._book.positions.items()
+            },
+        }
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+
+    def _restore_positions_from_local_snapshot(self, trade_date: str) -> int:
+        path = self._local_positions_path
+        if not os.path.exists(path):
+            return 0
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+            if str(payload.get("trade_date", "")).strip() != trade_date:
+                return 0
+            rows = payload.get("positions", {})
+            restored = 0
+            for row in rows.values():
+                if str(row["side"]) != "long":
+                    continue
+                position = PaperPosition(
+                    symbol=str(row["symbol"]),
+                    side=str(row["side"]),
+                    entry_price=float(row["entry_price"]),
+                    shares=int(row["shares"]),
+                    entry_ts=int(row["entry_ts"]),
+                    entry_change_pct=float(row.get("entry_change_pct", 0.0)),
+                    stop_price=float(row["stop_price"]),
+                    target_price=float(row["target_price"]),
+                    entry_atr=(float(row["entry_atr"]) if row.get("entry_atr") is not None else None),
+                    peak_price=float(row.get("peak_price", row["entry_price"])),
+                    trail_stop_price=float(row.get("trail_stop_price", row["stop_price"])),
+                    partial_exit_done=bool(row.get("partial_exit_done", False)),
+                )
+                self._book.positions[position.symbol] = position
+                restored += 1
+            if restored:
+                logger.info("AutoTrader restored %d positions from local snapshot %s", restored, path)
+            return restored
+        except Exception as exc:
+            logger.warning("Failed to restore local position snapshot %s: %s", path, exc)
+            return 0
 
     @staticmethod
     def _is_persistence_connection_error(exc: Exception) -> bool:
@@ -1893,7 +2141,7 @@ class AutoTrader:
         snapshot = self._book.build_snapshot(self._last_prices, session_id=self._session_id)
         recent_decisions = [report.to_dict() for report in self._decision_history[-40:]]
 
-        sells = [trade for trade in self._book.trade_history if trade.action in {"SELL", "COVER"}]
+        sells = [trade for trade in self._book.trade_history if trade.action == "SELL"]
         realized_pnl = sum(trade.pnl for trade in sells)
         unrealized_pnl = self._book.unrealized_pnl(self._last_prices)
         wins = sum(1 for trade in sells if trade.pnl > 0)
@@ -2052,16 +2300,32 @@ class AutoTrader:
         try:
             await asyncio.sleep(self._eod_report_delay_seconds)
             payload = self._build_daily_report_payload(ts_ms)
-            if int(payload.get("tradeCount", 0) or 0) <= 0:
+            has_activity = (
+                int(payload.get("tradeCount", 0) or 0) > 0
+                or len(payload.get("newPositions") or []) > 0
+            )
+            if not has_activity:
                 return
             result = self._daily_reporter.build_and_send(day_payload=payload)
             if asyncio.iscoroutine(result):
                 await result
             self._last_eod_report_date = report_date
+            logger.info(
+                "Daily EOD report sent for %s trades=%d new_positions=%d",
+                report_date,
+                int(payload.get("tradeCount", 0) or 0),
+                len(payload.get("newPositions") or []),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Daily EOD report failed: %s", exc)
+            logger.warning(
+                "Daily EOD report failed for %s trades=%d new_positions=%d: %s",
+                report_date,
+                int(payload.get("tradeCount", 0) or 0) if "payload" in locals() else 0,
+                len(payload.get("newPositions") or []) if "payload" in locals() else 0,
+                exc,
+            )
 
     def _build_daily_report_payload(self, ts_ms: int) -> dict[str, Any]:
         return build_daily_report_payload(
@@ -2108,12 +2372,12 @@ class AutoTrader:
                 symbol=symbol,
                 ts_ms=ts_ms,
                 final_reason="market_halt",
-                summary="大盤風險閘門啟動，暫停新的搶快進場。",
+                summary=f"大盤急跌保護（{self._market_change_pct:+.2f}%），暫停新進場。",
                 price=price,
                 change_pct=change_pct,
                 payload=payload,
                 supporting_factors=supporting_factors,
-                opposing_factors=[DecisionFactor("oppose", "大盤條件", f"加權指數 {self._market_change_pct:+.2f}% 低於風控門檻")],
+                opposing_factors=[DecisionFactor("oppose", "大盤條件", f"加權指數 {self._market_change_pct:+.2f}% 超過急跌門檻 {MARKET_HALT_PCT:.1f}%")],
                 risk_flags=["market_halt"],
                 trigger_type="risk",
                 confidence=18,
@@ -2437,7 +2701,8 @@ class AutoTrader:
     ) -> None:
         """出場 50% 部位：鎖定 1:1 利潤，停損移至進場成本價，剩餘繼續追蹤。"""
         position = self._book.positions[symbol]
-        execution_price = round(price * (1 - SLIPPAGE_BPS / 10000), 2)
+        slippage_bps = self._resolve_slippage_bps(symbol, price=price, shares=position.shares)
+        execution_price = round(price * (1 - slippage_bps / 10000), 2)
         gross_pnl = (execution_price - position.entry_price) * partial_shares
         net_pnl = self._risk.calc_net_pnl(position.entry_price, execution_price, partial_shares)
 
@@ -2480,7 +2745,6 @@ class AutoTrader:
             "[PAPER PARTIAL SELL] %s @ %.2f partial=%d remaining=%d net_pnl=%.0f",
             symbol, price, partial_shares, position.shares, net_pnl,
         )
-        await self._send(text)
 
     async def _paper_sell(
         self,
@@ -2616,13 +2880,13 @@ class AutoTrader:
             ]
         )
         logger.info("[PAPER SELL] %s @ %.2f reason=%s net_pnl=%.0f", symbol, price, reason, net_pnl)
-        await self._send(text)
 
         if self._risk.is_halted:
             await self._send(f"[風控警示] 當日損益已達限制：{daily_pnl:+,.0f} 元，系統將暫停新單。")
 
     async def _send_performance_report(self) -> None:
-        sells = [trade for trade in self._book.trade_history if trade.action in {"SELL", "COVER"}]
+        today = _ts_to_date(int(time.time() * 1000))
+        sells = [t for t in self._book.trade_history if t.action == "SELL" and _ts_to_date(t.ts) == today]
         realized_pnl = sum(trade.pnl for trade in sells)
         wins = sum(1 for trade in sells if trade.pnl > 0)
         win_rate = wins / len(sells) * 100 if sells else 0.0
@@ -2687,6 +2951,19 @@ class AutoTrader:
         if self._session and not self._session.closed:
             await self._session.close()
 
+
+for _legacy_method_name in (
+    "_evaluate_buy",
+    "_check_exit",
+    "_evaluate_short",
+    "_paper_short",
+    "_check_short_exit",
+    "_paper_cover",
+    "_close_all_eod",
+):
+    if hasattr(AutoTrader, _legacy_method_name):
+        delattr(AutoTrader, _legacy_method_name)
+
 # Time helpers
 
 def _ts_to_datetime(ts_ms: int) -> datetime.datetime:
@@ -2707,7 +2984,13 @@ def _previous_known_open_trading_date(date_str: str) -> str:
 
 
 def _is_trading_hours(ts_ms: int) -> bool:
-    """Return True during the trading session window (08:00–17:00)."""
+    """Return True during the trading session window (09:00–13:30).
+
+    In MOCK mode the calendar date check is skipped so simulation can run
+    on weekends and non-trading days.
+    """
+    if os.getenv("SINOPAC_MOCK", "false").lower() == "true":
+        return True
     dt = _ts_to_datetime(ts_ms)
     if not is_known_open_trading_date(dt.date()):
         return False
@@ -2723,7 +3006,7 @@ def _is_eod_close_time(ts_ms: int) -> bool:
 
 
 def _is_opening_breakout_window(ts_ms: int) -> bool:
-    """Return True during Taiwan market opening breakout window (09:00–09:30)."""
+    """Legacy opening-window helper retained for compatibility."""
     dt = _ts_to_datetime(ts_ms)
     t = dt.hour * 60 + dt.minute
     return 9 * 60 <= t <= 9 * 60 + 30
@@ -2753,15 +3036,13 @@ def _apply_strategy_params(params: dict) -> None:
     import auto_trader as _self
     if "BUY_SIGNAL_PCT" in params:
         _self.BUY_SIGNAL_PCT = float(params["BUY_SIGNAL_PCT"])
-    if "SHORT_SIGNAL_PCT" in params:
-        _self.SHORT_SIGNAL_PCT = float(params["SHORT_SIGNAL_PCT"])
     if "TRAIL_STOP_ATR_MULT" in params:
         _self.TRAIL_STOP_ATR_MULT = float(params["TRAIL_STOP_ATR_MULT"])
 
 
 def trader_from_env(
     *,
-    strategy_mode: str = "intraday",
+    strategy_mode: str = "retail_flow_swing",
     institutional_flow_provider: Any = None,
     institutional_flow_cache: Any = None,
     retail_flow_strategy: RetailFlowSwingStrategy | None = None,

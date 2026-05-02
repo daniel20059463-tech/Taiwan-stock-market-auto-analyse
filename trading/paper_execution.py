@@ -12,13 +12,9 @@ class PaperExecutionService:
         *,
         buy_executor: Callable[..., Awaitable[None]],
         sell_executor: Callable[..., Awaitable[None]],
-        short_executor: Callable[..., Awaitable[None]],
-        cover_executor: Callable[..., Awaitable[None]],
     ) -> None:
         self._buy_executor = buy_executor
         self._sell_executor = sell_executor
-        self._short_executor = short_executor
-        self._cover_executor = cover_executor
 
     async def execute_buy(self, **kwargs: Any) -> None:
         await self._buy_executor(**kwargs)
@@ -27,7 +23,11 @@ class PaperExecutionService:
         await self._sell_executor(**kwargs)
 
     async def execute_short(self, **kwargs: Any) -> None:
-        await self._short_executor(**kwargs)
+        raise RuntimeError(
+            "execute_short called but short execution is not supported in retail_flow_swing mode"
+        )
 
     async def execute_cover(self, **kwargs: Any) -> None:
-        await self._cover_executor(**kwargs)
+        raise RuntimeError(
+            "execute_cover called but cover execution is not supported in retail_flow_swing mode"
+        )

@@ -34,6 +34,76 @@ _LIMIT_UP_PCT = 9.5
 _LIMIT_DOWN_PCT = -9.5
 _TAIEX_SYMBOL = "TSE001"          # 加權指數在 shioaji 的合約代號
 _LOGIN_RETRY_DELAYS = (5.0, 15.0, 65.0)
+_DEFAULT_WATCHDOG_CHECK_SECONDS = 10.0
+_DEFAULT_TICK_STALE_SECONDS = 45.0
+_MIN_WATCHDOG_CHECK_SECONDS = 1.0
+_MIN_TICK_STALE_SECONDS = 5.0
+_DEFAULT_AUTH_PROBE_SECONDS = 20.0
+_MIN_AUTH_PROBE_SECONDS = 5.0
+
+
+def _read_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _build_watchdog_settings() -> dict[str, float]:
+    check_interval = max(
+        _MIN_WATCHDOG_CHECK_SECONDS,
+        _read_float_env("SINOPAC_WATCHDOG_CHECK_SECONDS", _DEFAULT_WATCHDOG_CHECK_SECONDS),
+    )
+    tick_stale = max(
+        _MIN_TICK_STALE_SECONDS,
+        _read_float_env("SINOPAC_TICK_STALE_SECONDS", _DEFAULT_TICK_STALE_SECONDS),
+    )
+    auth_probe = max(
+        _MIN_AUTH_PROBE_SECONDS,
+        _read_float_env("SINOPAC_AUTH_PROBE_SECONDS", _DEFAULT_AUTH_PROBE_SECONDS),
+    )
+    return {
+        "check_interval_seconds": check_interval,
+        "tick_stale_seconds": tick_stale,
+        "auth_probe_seconds": auth_probe,
+    }
+
+
+def _error_indicates_token_expired(error: Any) -> bool:
+    detail = str(error).lower()
+    return (
+        "token is expired" in detail
+        or "status_code': 401" in detail
+        or "status_code: 401" in detail
+        or " 401 " in detail
+    )
+
+
+def _probe_api_health_sync(*, api: Any, contract: Any | None) -> str:
+    if api is None or contract is None:
+        return "unavailable"
+    try:
+        api.snapshots([contract])
+        return "ok"
+    except Exception as exc:
+        if _error_indicates_token_expired(exc):
+            return "token_expired"
+        return "error"
+
+
+def _should_watchdog_reconnect(
+    *,
+    now_tw: datetime.datetime,
+    elapsed_seconds: float,
+    tick_stale_seconds: float,
+) -> bool:
+    trading_minute = now_tw.hour * 60 + now_tw.minute
+    if not (_MARKET_OPEN_MIN <= trading_minute <= _MARKET_CLOSE_MIN):
+        return False
+    return elapsed_seconds >= tick_stale_seconds
 
 
 def _preload_history_cache_worker(symbols: list[str], months: int, cache_path: str) -> None:
@@ -125,6 +195,9 @@ class SinopacCollector:
         self._taiex_prev_close: float = 0.0   # 加權指數前收（用於計算漲跌幅）
         self._last_tick_monotonic: float = 0.0
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_settings = _build_watchdog_settings()
+        self._last_auth_probe_monotonic: float = 0.0
         self._history_preload_processes: list[multiprocessing.Process] = []
         self._history_preload_inflight: set[str] = set()
         self._reconnecting: bool = False
@@ -139,7 +212,7 @@ class SinopacCollector:
         self._order_book_buffers = self._native_order_books.buffers
         self._trade_tape_buffers = self._native_trade_tapes.buffers
         self._last_trade_prices = self._native_trade_tapes.last_trade_prices
-        self.visible_symbols: set[str] = set(symbols)
+        self.visible_symbols: set[str] = set()
         self._subscribed_visible_symbols: set[str] = set()
         self._symbol_contracts: dict[str, Any] = {}
         self._reconnect_lock = threading.Lock()
@@ -158,6 +231,25 @@ class SinopacCollector:
             build_order_book_snapshot=self._build_order_book_snapshot,
             build_trade_tape_snapshot=self._build_trade_tape_snapshot,
         )
+
+    def _request_reconnect(self, reason: str) -> None:
+        if self._reconnecting:
+            logger.info("Reconnect already in progress, skip duplicate request: %s", reason)
+            return
+
+        def _run() -> None:
+            try:
+                logger.warning("Triggering Shioaji reconnect: %s", reason)
+                self._reconnect_sync()
+                logger.info("Shioaji reconnect completed: %s", reason)
+            except Exception as exc:
+                logger.error("Shioaji reconnect failed (%s): %s", reason, exc)
+
+        threading.Thread(
+            target=_run,
+            name=f"sinopac-reconnect-{reason}",
+            daemon=True,
+        ).start()
 
     def _get_contract_sync(self, symbol: str) -> Any | None:
         if self._api is None:
@@ -193,6 +285,12 @@ class SinopacCollector:
         await self._loop.run_in_executor(None, self._login_and_subscribe_sync)
         self._last_tick_monotonic = time.monotonic()
         self._watchdog_task = asyncio.create_task(self._watchdog_loop(), name="sinopac-watchdog")
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_sync_loop,
+            name="sinopac-watchdog-sync",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
         logger.info("SinopacCollector ready on ws://%s:%d symbols=%s", self._ws_host, self._ws_port, self._symbols)
 
     async def stop_accepting(self) -> None:
@@ -227,23 +325,52 @@ class SinopacCollector:
         return len(self._dirty_symbols)
 
     async def _watchdog_loop(self) -> None:
-        """每 60 秒檢查一次：交易時段內超過 5 分鐘無 tick，自動重新登入並訂閱。"""
-        _CHECK_INTERVAL = 60.0
-        _TICK_TIMEOUT = 300.0  # 5 分鐘
+        """定期檢查：交易時段內 tick 停更過久時，自動重新登入並訂閱。"""
+        check_interval = self._watchdog_settings["check_interval_seconds"]
+        tick_stale_seconds = self._watchdog_settings["tick_stale_seconds"]
+        auth_probe_seconds = self._watchdog_settings["auth_probe_seconds"]
         try:
             while self._accepting:
-                await asyncio.sleep(_CHECK_INTERVAL)
+                await asyncio.sleep(check_interval)
                 if not self._accepting or self._reconnecting:
                     continue
                 now_tw = datetime.datetime.now(tz=_TZ_TW)
-                t = now_tw.hour * 60 + now_tw.minute
-                if not (_MARKET_OPEN_MIN <= t <= _MARKET_CLOSE_MIN):
-                    continue
+                trading_minute = now_tw.hour * 60 + now_tw.minute
+                in_market_hours = _MARKET_OPEN_MIN <= trading_minute <= _MARKET_CLOSE_MIN
+                if in_market_hours and time.monotonic() - self._last_auth_probe_monotonic >= auth_probe_seconds:
+                    self._last_auth_probe_monotonic = time.monotonic()
+                    contract = None
+                    visible_or_seed = next(iter(self.visible_symbols or self._symbols), None)
+                    if visible_or_seed:
+                        contract = self._get_contract_sync(visible_or_seed)
+                    if contract is not None:
+                        try:
+                            probe_status = await self._loop.run_in_executor(
+                                None,
+                                lambda: _probe_api_health_sync(api=self._api, contract=contract),
+                            )
+                        except Exception as exc:
+                            logger.debug("watchdog auth probe failed: %s", exc)
+                            probe_status = "error"
+                        if probe_status == "token_expired":
+                            logger.warning("Auth probe detected expired token; triggering reconnect")
+                            try:
+                                await self._loop.run_in_executor(None, self._reconnect_sync)
+                                logger.info("Shioaji reconnect completed after auth probe expiry")
+                            except Exception as exc:
+                                logger.error("Shioaji reconnect failed after auth probe expiry: %s", exc)
+                            continue
                 elapsed = time.monotonic() - self._last_tick_monotonic
-                if elapsed < _TICK_TIMEOUT:
+                if not _should_watchdog_reconnect(
+                    now_tw=now_tw,
+                    elapsed_seconds=elapsed,
+                    tick_stale_seconds=tick_stale_seconds,
+                ):
                     continue
                 logger.warning(
-                    "交易時段內 %.0f 秒無 tick，重新連線永豐 API…", elapsed
+                    "交易時段內 %.0f 秒無 tick，觸發 watchdog 重連（timeout=%.0f 秒）",
+                    elapsed,
+                    tick_stale_seconds,
                 )
                 loop = self._loop
                 if loop is None:
@@ -255,6 +382,55 @@ class SinopacCollector:
                     logger.error("永豐 API 重新連線失敗: %s", exc)
         except asyncio.CancelledError:
             return
+        except Exception as exc:
+            logger.error("async watchdog crashed: %s", exc)
+            return
+
+    def _watchdog_sync_loop(self) -> None:
+        check_interval = self._watchdog_settings["check_interval_seconds"]
+        tick_stale_seconds = self._watchdog_settings["tick_stale_seconds"]
+        auth_probe_seconds = self._watchdog_settings["auth_probe_seconds"]
+
+        while self._accepting:
+            time.sleep(check_interval)
+            if not self._accepting or self._reconnecting:
+                continue
+            now_tw = datetime.datetime.now(tz=_TZ_TW)
+            trading_minute = now_tw.hour * 60 + now_tw.minute
+            in_market_hours = _MARKET_OPEN_MIN <= trading_minute <= _MARKET_CLOSE_MIN
+
+            if in_market_hours and time.monotonic() - self._last_auth_probe_monotonic >= auth_probe_seconds:
+                self._last_auth_probe_monotonic = time.monotonic()
+                symbol = next(iter(self.visible_symbols or self._symbols), None)
+                contract = self._get_contract_sync(symbol) if symbol else None
+                probe_status = _probe_api_health_sync(api=self._api, contract=contract)
+                if probe_status == "token_expired":
+                    logger.warning("Auth probe detected expired token; triggering reconnect")
+                    try:
+                        self._reconnect_sync()
+                        logger.info("Shioaji reconnect completed after auth probe expiry")
+                    except Exception as exc:
+                        logger.error("Shioaji reconnect failed after auth probe expiry: %s", exc)
+                    continue
+
+            elapsed = time.monotonic() - self._last_tick_monotonic
+            if not _should_watchdog_reconnect(
+                now_tw=now_tw,
+                elapsed_seconds=elapsed,
+                tick_stale_seconds=tick_stale_seconds,
+            ):
+                continue
+
+            logger.warning(
+                "交易時段內 %.0f 秒無 tick，sync watchdog 觸發重連（timeout=%.0f 秒）",
+                elapsed,
+                tick_stale_seconds,
+            )
+            try:
+                self._reconnect_sync()
+                logger.info("永豐 API 重新連線成功（sync watchdog）")
+            except Exception as exc:
+                logger.error("永豐 API 重新連線失敗（sync watchdog）: %s", exc)
 
     def _reconnect_sync(self) -> None:
         """斷線重連：登出舊 API → 重新 login + subscribe。"""
@@ -351,10 +527,35 @@ class SinopacCollector:
                 return
             self._offer_bidask_threadsafe(bidask)
 
+        def _on_session_down() -> None:
+            self._request_reconnect("quote_session_down")
+
+        def _on_quote_event(resp_code: int, event_code: int, info: str, event: str) -> None:
+            detail = " ".join(str(part) for part in (resp_code, event_code, info, event))
+            if _error_indicates_token_expired(detail):
+                self._request_reconnect("quote_event_token_expired")
+
         quote.set_on_tick_stk_v1_callback(_on_tick)
         quote.set_on_bidask_stk_v1_callback(_on_bidask)
+        set_session_down_callback = getattr(quote, "set_session_down_callback", None)
+        if callable(set_session_down_callback):
+            set_session_down_callback(_on_session_down)
+        set_event_callback = getattr(quote, "set_event_callback", None)
+        if callable(set_event_callback):
+            set_event_callback(_on_quote_event)
+        api_session_down_callback = getattr(api, "set_session_down_callback", None)
+        if callable(api_session_down_callback):
+            api_session_down_callback(_on_session_down)
+        api_on_event = getattr(api, "on_event", None)
+        if callable(api_on_event):
+            api_on_event(_on_quote_event)
 
         self._subscribed_visible_symbols.clear()
+        if self._auto_trader is not None and hasattr(self._auto_trader, "get_required_symbols"):
+            required = self._auto_trader.get_required_symbols()
+            if required:
+                self.visible_symbols.update(required)
+                logger.info("Strategy subscription: %d symbols (watchlist + positions)", len(required))
         self._sync_visible_symbol_subscriptions()
 
         # ── 訂閱加權指數（大盤方向過濾）────────────────────────────────────────
@@ -411,6 +612,9 @@ class SinopacCollector:
         for attempt in range(1, attempts + 1):
             try:
                 api.login(api_key=self._api_key, secret_key=self._secret_key)
+                fetch_contracts = getattr(api, "fetch_contracts", None)
+                if callable(fetch_contracts):
+                    fetch_contracts(contract_download=True, contracts_timeout=120000)
                 if attempt > 1:
                     logger.info("Shioaji login recovered on attempt %d/%d", attempt, attempts)
                 return

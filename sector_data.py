@@ -26,6 +26,7 @@ TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_companies_informat
 
 SECTOR_CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 _REQUEST_TIMEOUT = 15
+_MIN_COMPLETE_SECTOR_MAP_SIZE = 1800
 
 # TWSE 産業別代碼 → 中文名稱（2021 年重分類後版本）
 # 驗證依據：2330 TSMC=24(半導體), 2303 UMC=24, 2454 MediaTek=24,
@@ -87,8 +88,11 @@ def fetch_sector_map(cache_path: Optional[str] = None) -> dict[str, str]:
     if cache_path and _cache_is_fresh(cache_path):
         loaded = _load_cache(cache_path)
         if loaded:
-            logger.info("sector_data: loaded %d symbols from cache %s", len(loaded), cache_path)
-            return loaded
+            enriched = _augment_sector_map_with_shioaji(loaded)
+            if cache_path and enriched != loaded:
+                _save_cache(cache_path, enriched)
+            logger.info("sector_data: loaded %d symbols from cache %s", len(enriched), cache_path)
+            return enriched
 
     sector_map: dict[str, str] = {}
 
@@ -99,6 +103,8 @@ def fetch_sector_map(cache_path: Optional[str] = None) -> dict[str, str]:
     tpex = _fetch_tpex()
     sector_map.update(tpex)
     logger.info("sector_data: TPEX %d symbols fetched", len(tpex))
+
+    sector_map = _augment_sector_map_with_shioaji(sector_map)
 
     if cache_path and sector_map:
         _save_cache(cache_path, sector_map)
@@ -156,6 +162,87 @@ def _fetch_tpex() -> dict[str, str]:
         if code and sector:
             result[code] = sector
     return result
+
+
+def _normalize_sector_name(raw_sector: str) -> str:
+    sector = str(raw_sector or "").strip()
+    if len(sector) == 2 and sector.isdigit():
+        return _TWSE_SECTOR_NAMES.get(sector, sector)
+    return sector
+
+
+def _build_sector_map_from_shioaji_universe(universe: dict[str, dict[str, str]]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for symbol, meta in universe.items():
+        code = str(symbol or meta.get("symbol", "")).strip()
+        raw_sector = str(meta.get("sector") or meta.get("category") or "").strip()
+        sector = _normalize_sector_name(raw_sector)
+        if code and sector:
+            result[code] = sector
+    return result
+
+
+def _needs_shioaji_augmentation(sector_map: dict[str, str]) -> bool:
+    return len(sector_map) < _MIN_COMPLETE_SECTOR_MAP_SIZE
+
+
+def _augment_sector_map_with_shioaji(sector_map: dict[str, str]) -> dict[str, str]:
+    if not _needs_shioaji_augmentation(sector_map):
+        return dict(sector_map)
+
+    shioaji_map = _fetch_shioaji_universe_sector_map()
+    if not shioaji_map:
+        return dict(sector_map)
+
+    merged = dict(sector_map)
+    for symbol, sector in shioaji_map.items():
+        if symbol and sector:
+            merged.setdefault(symbol, sector)
+    logger.info(
+        "sector_data: augmented sector map with shioaji universe %d -> %d symbols",
+        len(sector_map),
+        len(merged),
+    )
+    return merged
+
+
+def _load_sinopac_credentials(dotenv_path: Optional[str] = None) -> tuple[str, str]:
+    path = dotenv_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        if os.path.exists(path):
+            from dotenv import load_dotenv
+
+            load_dotenv(path, override=False)
+    except Exception:
+        pass
+
+    api_key = os.getenv("SINOPAC_API_KEY", "").strip()
+    secret_key = os.getenv("SINOPAC_SECRET_KEY", "").strip()
+    return api_key, secret_key
+
+
+def _fetch_shioaji_universe_sector_map() -> dict[str, str]:
+    api_key, secret_key = _load_sinopac_credentials()
+    if not api_key or not secret_key:
+        return {}
+
+    try:
+        import shioaji as sj
+        from quote_runtime.universe_loader import load_shioaji_stock_universe
+
+        api = sj.Shioaji(simulation=False)
+        try:
+            api.login(api_key=api_key, secret_key=secret_key)
+            universe = load_shioaji_stock_universe(api)
+            return _build_sector_map_from_shioaji_universe(universe)
+        finally:
+            try:
+                api.logout()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("sector_data: shioaji universe fallback failed: %s", exc)
+        return {}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

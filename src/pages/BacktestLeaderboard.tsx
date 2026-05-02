@@ -1,5 +1,5 @@
 import { useMemo, useState, type CSSProperties } from "react";
-import leaderboard from "../../backtest_results/strong_stocks_intraday.json";
+import leaderboard from "./backtestLeaderboardFixture";
 import {
   buildBacktestSummary,
   rankBacktestResults,
@@ -23,11 +23,11 @@ const mono: CSSProperties = { fontFamily: "var(--font-mono)" };
 
 const rankOptions: Array<{ key: BacktestRankingMode; label: string }> = [
   { key: "overall", label: "總排名" },
-  { key: "pnl", label: "獲利排名" },
-  { key: "winRate", label: "勝率排名" },
-  { key: "drawdown", label: "低回撤排名" },
-  { key: "activity", label: "高活躍排名" },
-  { key: "inactive", label: "零成交清單" },
+  { key: "pnl", label: "總損益" },
+  { key: "winRate", label: "勝率" },
+  { key: "drawdown", label: "回撤" },
+  { key: "activity", label: "交易數" },
+  { key: "inactive", label: "零成交" },
 ];
 
 function formatSigned(value: number): string {
@@ -36,8 +36,22 @@ function formatSigned(value: number): string {
 
 function SummaryCard({ label, value, tone }: { label: string; value: string; tone?: string }) {
   return (
-    <div style={{ border: `1px solid ${palette.border}`, background: "rgba(255,255,255,0.02)", padding: "14px 16px" }}>
-      <div style={{ color: palette.muted, fontSize: "12px", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: "8px" }}>
+    <div
+      style={{
+        border: `1px solid ${palette.border}`,
+        background: "rgba(255,255,255,0.02)",
+        padding: "14px 16px",
+      }}
+    >
+      <div
+        style={{
+          color: palette.muted,
+          fontSize: "12px",
+          letterSpacing: "0.08em",
+          textTransform: "uppercase",
+          marginBottom: "8px",
+        }}
+      >
         {label}
       </div>
       <div style={{ color: tone ?? palette.text, fontSize: "28px", fontWeight: 800 }}>{value}</div>
@@ -49,7 +63,7 @@ function DetailPanel({ row }: { row: BacktestLeaderboardItem | null }) {
   if (!row) {
     return (
       <aside style={{ border: `1px solid ${palette.border}`, background: palette.panel, padding: "16px" }}>
-        <div style={{ color: palette.muted }}>選取一檔股票後，這裡會顯示回測摘要與最近出場原因。</div>
+        <div style={{ color: palette.muted }}>選取股票後顯示回測明細。</div>
       </aside>
     );
   }
@@ -62,10 +76,26 @@ function DetailPanel({ row }: { row: BacktestLeaderboardItem | null }) {
   ).sort((left, right) => right[1] - left[1]);
 
   return (
-    <aside style={{ border: `1px solid ${palette.border}`, background: palette.panel, padding: "16px", display: "grid", gap: "14px" }}>
+    <aside
+      style={{
+        border: `1px solid ${palette.border}`,
+        background: palette.panel,
+        padding: "16px",
+        display: "grid",
+        gap: "14px",
+      }}
+    >
       <div>
-        <div style={{ color: palette.muted, fontSize: "12px", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: "8px" }}>
-          單檔摘要
+        <div
+          style={{
+            color: palette.muted,
+            fontSize: "12px",
+            letterSpacing: "0.08em",
+            textTransform: "uppercase",
+            marginBottom: "8px",
+          }}
+        >
+          個股明細
         </div>
         <div style={{ fontSize: "30px", fontWeight: 800, color: palette.text }}>
           {row.symbol} {row.name}
@@ -86,9 +116,9 @@ function DetailPanel({ row }: { row: BacktestLeaderboardItem | null }) {
       </div>
 
       <div style={{ border: `1px solid ${palette.border}`, background: "rgba(255,255,255,0.02)", padding: "14px 16px" }}>
-        <div style={{ color: palette.muted, marginBottom: "10px" }}>最近出場原因</div>
+        <div style={{ color: palette.muted, marginBottom: "10px" }}>主要出場原因</div>
         {reasons.length === 0 ? (
-          <div style={{ color: palette.muted }}>目前這批回測中沒有出手，這檔沒有可分析的出場原因。</div>
+          <div style={{ color: palette.muted }}>這檔股票沒有成交紀錄。</div>
         ) : (
           <div style={{ display: "grid", gap: "8px" }}>
             {reasons.slice(0, 5).map(([reason, count]) => (
@@ -119,20 +149,20 @@ export function BacktestLeaderboard() {
           <div>
             <h1 style={{ margin: 0, fontSize: "34px", fontWeight: 800 }}>回測排行榜</h1>
             <div style={{ marginTop: "8px", color: palette.muted, lineHeight: 1.7 }}>
-              直接讀取目前這批回測總表，快速看出哪幾檔最能賺、哪幾檔勝率高、哪幾檔風險最低。
+              依總損益、勝率、最大回撤與交易活躍度檢視回測結果，便於快速比較標的表現。
             </div>
           </div>
           <div style={{ display: "grid", gap: "6px", color: palette.muted, ...mono }}>
             <span>期間：{leaderboard.period}</span>
             <span>模式：{leaderboard.mode}</span>
-            <span>更新：{new Date(leaderboard.generated_at).toLocaleString("zh-TW", { hour12: false })}</span>
+            <span>產出：{new Date(leaderboard.generated_at).toLocaleString("zh-TW", { hour12: false })}</span>
           </div>
         </div>
       </section>
 
       <section style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: "12px", marginBottom: "18px" }}>
-        <SummaryCard label="回測標的" value={String(summary.totalSymbols)} />
-        <SummaryCard label="有獲利標的" value={String(summary.profitableSymbols)} tone={palette.success} />
+        <SummaryCard label="標的數" value={String(summary.totalSymbols)} />
+        <SummaryCard label="獲利標的" value={String(summary.profitableSymbols)} tone={palette.success} />
         <SummaryCard label="零成交標的" value={String(summary.inactiveSymbols)} tone={palette.warning} />
         <SummaryCard label="總交易數" value={String(summary.totalTrades)} />
         <SummaryCard label="最佳標的" value={summary.bestSymbol ?? "-"} tone={palette.accent} />
@@ -181,7 +211,7 @@ export function BacktestLeaderboard() {
 
           <div style={{ maxHeight: "calc(100vh - 280px)", overflowY: "auto" }}>
             {ranked.length === 0 ? (
-              <div style={{ padding: "16px", color: palette.muted }}>目前這批回測中沒有符合條件的標的。</div>
+              <div style={{ padding: "16px", color: palette.muted }}>沒有符合條件的回測結果。</div>
             ) : (
               ranked.map((row, index) => (
                 <div
@@ -201,7 +231,7 @@ export function BacktestLeaderboard() {
                       {row.symbol} {row.name}
                     </div>
                     <div style={{ marginTop: "4px", color: palette.muted }}>
-                      {row.total_trades === 0 ? "本期未出手" : `${row.total_trades} 筆交易，${row.win_trades} 勝 ${row.loss_trades} 敗`}
+                      {row.total_trades === 0 ? "無成交紀錄" : `${row.total_trades} 筆交易，勝 ${row.win_trades} / 負 ${row.loss_trades}`}
                     </div>
                   </div>
                   <div style={{ ...mono, color: row.total_pnl >= 0 ? palette.success : palette.danger }}>{formatSigned(row.total_pnl)}</div>
@@ -219,3 +249,5 @@ export function BacktestLeaderboard() {
     </div>
   );
 }
+
+export default BacktestLeaderboard;

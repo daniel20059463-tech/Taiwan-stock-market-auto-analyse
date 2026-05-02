@@ -8,8 +8,12 @@ import types
 
 from sinopac_bridge import (
     SinopacCollector,
+    _build_watchdog_settings,
     _bind_index_tick_handler,
+    _error_indicates_token_expired,
     _merge_seed_meta,
+    _probe_api_health_sync,
+    _should_watchdog_reconnect,
     _sanitize_quote_payload,
     _to_epoch_milliseconds,
     load_shioaji_stock_universe,
@@ -90,6 +94,72 @@ def build_test_collector() -> tuple[SinopacCollector, _FakeApi]:
     collector._symbol_contracts = contracts
     collector._subscribed_visible_symbols = set()
     return collector, fake_api
+
+
+def test_build_watchdog_settings_uses_defaults_when_env_missing(monkeypatch) -> None:
+    monkeypatch.delenv("SINOPAC_WATCHDOG_CHECK_SECONDS", raising=False)
+    monkeypatch.delenv("SINOPAC_TICK_STALE_SECONDS", raising=False)
+    monkeypatch.delenv("SINOPAC_AUTH_PROBE_SECONDS", raising=False)
+
+    settings = _build_watchdog_settings()
+
+    assert settings == {
+        "check_interval_seconds": 10.0,
+        "tick_stale_seconds": 45.0,
+        "auth_probe_seconds": 20.0,
+    }
+
+
+def test_build_watchdog_settings_respects_env_and_clamps_invalid_low_values(monkeypatch) -> None:
+    monkeypatch.setenv("SINOPAC_WATCHDOG_CHECK_SECONDS", "0")
+    monkeypatch.setenv("SINOPAC_TICK_STALE_SECONDS", "3")
+    monkeypatch.setenv("SINOPAC_AUTH_PROBE_SECONDS", "0")
+
+    settings = _build_watchdog_settings()
+
+    assert settings == {
+        "check_interval_seconds": 1.0,
+        "tick_stale_seconds": 5.0,
+        "auth_probe_seconds": 5.0,
+    }
+
+
+def test_error_indicates_token_expired_matches_common_messages() -> None:
+    assert _error_indicates_token_expired("Token is expired") is True
+    assert _error_indicates_token_expired("status_code: 401") is True
+    assert _error_indicates_token_expired("{'status': {'status_code': 401}, 'response': {'detail': 'Token is expired'}}") is True
+    assert _error_indicates_token_expired("network timeout") is False
+
+
+def test_probe_api_health_sync_reports_token_expired_from_snapshot_failure() -> None:
+    contract = types.SimpleNamespace(code="2330")
+    api = types.SimpleNamespace(
+        snapshots=lambda contracts: (_ for _ in ()).throw(RuntimeError("Token is expired")),
+    )
+
+    status = _probe_api_health_sync(api=api, contract=contract)
+
+    assert status == "token_expired"
+
+
+def test_probe_api_health_sync_reports_ok_when_snapshot_succeeds() -> None:
+    contract = types.SimpleNamespace(code="2330")
+    api = types.SimpleNamespace(
+        snapshots=lambda contracts: [types.SimpleNamespace(close=950.0)],
+    )
+
+    status = _probe_api_health_sync(api=api, contract=contract)
+
+    assert status == "ok"
+
+
+def test_should_watchdog_reconnect_only_returns_true_during_market_hours_when_tick_is_stale() -> None:
+    market_open = datetime.datetime(2026, 4, 27, 9, 15, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+    after_close = datetime.datetime(2026, 4, 27, 13, 31, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+
+    assert _should_watchdog_reconnect(now_tw=market_open, elapsed_seconds=46.0, tick_stale_seconds=45.0) is True
+    assert _should_watchdog_reconnect(now_tw=market_open, elapsed_seconds=44.0, tick_stale_seconds=45.0) is False
+    assert _should_watchdog_reconnect(now_tw=after_close, elapsed_seconds=120.0, tick_stale_seconds=45.0) is False
 
 
 def test_set_visible_symbols_updates_high_frequency_subscription_set(monkeypatch) -> None:
@@ -1055,6 +1125,12 @@ def test_sinopac_collector_login_and_subscribe_sync_subscribes_tick_and_bidask(m
     applied_bidasks: list[object] = []
     collector._apply_native_bidask = lambda bidask: applied_bidasks.append(bidask)
 
+    # Wire a mock auto_trader so the bridge subscribes only the required symbols
+    class _FakeAutoTrader:
+        def get_required_symbols(self) -> list[str]:
+            return ["2330", "2317"]
+
+    collector._auto_trader = _FakeAutoTrader()
     collector._login_and_subscribe_sync()
 
     assert fake_api.logged_in == ("demo", "demo")
@@ -1072,6 +1148,240 @@ def test_sinopac_collector_login_and_subscribe_sync_subscribes_tick_and_bidask(m
     fake_api.quote.bidask_callback(None, bidask)
 
     assert applied_bidasks == [bidask]
+
+
+def test_sinopac_collector_session_down_callback_requests_reconnect(monkeypatch) -> None:
+    import sinopac_bridge as bridge
+
+    class _FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback, *args) -> None:
+            callback(*args)
+
+    class _FakeQuote:
+        def __init__(self) -> None:
+            self.subscriptions: list[tuple[str, object, object]] = []
+            self.tick_callback = None
+            self.bidask_callback = None
+            self.session_down_callback = None
+            self.event_callback = None
+
+        def subscribe(self, contract, quote_type, version) -> None:
+            self.subscriptions.append((contract.code, quote_type, version))
+
+        def set_on_tick_stk_v1_callback(self, callback) -> None:
+            self.tick_callback = callback
+
+        def set_on_bidask_stk_v1_callback(self, callback) -> None:
+            self.bidask_callback = callback
+
+        def set_session_down_callback(self, callback) -> None:
+            self.session_down_callback = callback
+
+        def set_event_callback(self, callback) -> None:
+            self.event_callback = callback
+
+    class _FakeApi:
+        def __init__(self) -> None:
+            self.quote = _FakeQuote()
+            self.Contracts = types.SimpleNamespace(
+                Stocks=types.SimpleNamespace(TSE={"2330": types.SimpleNamespace(code="2330")}, OTC={}, OES={}),
+                Indices=types.SimpleNamespace(TSE={"TSE001": types.SimpleNamespace(code="TSE001")}),
+            )
+
+        def login(self, *, api_key, secret_key) -> None:
+            return None
+
+        def logout(self) -> None:
+            return None
+
+        def snapshots(self, contracts) -> list[object]:
+            return []
+
+    fake_api = _FakeApi()
+    fake_sj = types.SimpleNamespace(Shioaji=lambda simulation=False: fake_api)
+    fake_constant = types.SimpleNamespace(
+        QuoteType=types.SimpleNamespace(Tick="Tick", BidAsk="BidAsk"),
+        QuoteVersion=types.SimpleNamespace(v1="v1"),
+    )
+
+    monkeypatch.setitem(sys.modules, "shioaji", fake_sj)
+    monkeypatch.setitem(sys.modules, "shioaji.constant", fake_constant)
+    monkeypatch.setattr(bridge, "_load_twse_seed_quotes", lambda symbols: {})
+
+    collector = SinopacCollector(
+        ["2330"],
+        api_key="demo",
+        secret_key="demo",
+        bootstrap_bar_limit=0,
+    )
+    collector._loop = _FakeLoop()
+    reconnect_calls: list[str] = []
+    collector._request_reconnect = lambda reason: reconnect_calls.append(reason)  # type: ignore[method-assign]
+
+    collector._login_and_subscribe_sync()
+    assert fake_api.quote.session_down_callback is not None
+
+    fake_api.quote.session_down_callback()
+
+    assert reconnect_calls == ["quote_session_down"]
+
+
+def test_sinopac_collector_token_expired_event_requests_reconnect(monkeypatch) -> None:
+    import sinopac_bridge as bridge
+
+    class _FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback, *args) -> None:
+            callback(*args)
+
+    class _FakeQuote:
+        def __init__(self) -> None:
+            self.subscriptions: list[tuple[str, object, object]] = []
+            self.tick_callback = None
+            self.bidask_callback = None
+            self.session_down_callback = None
+            self.event_callback = None
+
+        def subscribe(self, contract, quote_type, version) -> None:
+            self.subscriptions.append((contract.code, quote_type, version))
+
+        def set_on_tick_stk_v1_callback(self, callback) -> None:
+            self.tick_callback = callback
+
+        def set_on_bidask_stk_v1_callback(self, callback) -> None:
+            self.bidask_callback = callback
+
+        def set_session_down_callback(self, callback) -> None:
+            self.session_down_callback = callback
+
+        def set_event_callback(self, callback) -> None:
+            self.event_callback = callback
+
+    class _FakeApi:
+        def __init__(self) -> None:
+            self.quote = _FakeQuote()
+            self.Contracts = types.SimpleNamespace(
+                Stocks=types.SimpleNamespace(TSE={"2330": types.SimpleNamespace(code="2330")}, OTC={}, OES={}),
+                Indices=types.SimpleNamespace(TSE={"TSE001": types.SimpleNamespace(code="TSE001")}),
+            )
+
+        def login(self, *, api_key, secret_key) -> None:
+            return None
+
+        def logout(self) -> None:
+            return None
+
+        def snapshots(self, contracts) -> list[object]:
+            return []
+
+    fake_api = _FakeApi()
+    fake_sj = types.SimpleNamespace(Shioaji=lambda simulation=False: fake_api)
+    fake_constant = types.SimpleNamespace(
+        QuoteType=types.SimpleNamespace(Tick="Tick", BidAsk="BidAsk"),
+        QuoteVersion=types.SimpleNamespace(v1="v1"),
+    )
+
+    monkeypatch.setitem(sys.modules, "shioaji", fake_sj)
+    monkeypatch.setitem(sys.modules, "shioaji.constant", fake_constant)
+    monkeypatch.setattr(bridge, "_load_twse_seed_quotes", lambda symbols: {})
+
+    collector = SinopacCollector(
+        ["2330"],
+        api_key="demo",
+        secret_key="demo",
+        bootstrap_bar_limit=0,
+    )
+    collector._loop = _FakeLoop()
+    reconnect_calls: list[str] = []
+    collector._request_reconnect = lambda reason: reconnect_calls.append(reason)  # type: ignore[method-assign]
+
+    collector._login_and_subscribe_sync()
+    assert fake_api.quote.event_callback is not None
+
+    fake_api.quote.event_callback(401, 0, "auth", "Token is expired")
+
+    assert reconnect_calls == ["quote_event_token_expired"]
+
+
+def test_sinopac_collector_api_event_token_expired_requests_reconnect(monkeypatch) -> None:
+    import sinopac_bridge as bridge
+
+    class _FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback, *args) -> None:
+            callback(*args)
+
+    class _FakeQuote:
+        def __init__(self) -> None:
+            self.subscriptions: list[tuple[str, object, object]] = []
+            self.tick_callback = None
+            self.bidask_callback = None
+
+        def subscribe(self, contract, quote_type, version) -> None:
+            self.subscriptions.append((contract.code, quote_type, version))
+
+        def set_on_tick_stk_v1_callback(self, callback) -> None:
+            self.tick_callback = callback
+
+        def set_on_bidask_stk_v1_callback(self, callback) -> None:
+            self.bidask_callback = callback
+
+    class _FakeApi:
+        def __init__(self) -> None:
+            self.quote = _FakeQuote()
+            self.Contracts = types.SimpleNamespace(
+                Stocks=types.SimpleNamespace(TSE={"2330": types.SimpleNamespace(code="2330")}, OTC={}, OES={}),
+                Indices=types.SimpleNamespace(TSE={"TSE001": types.SimpleNamespace(code="TSE001")}),
+            )
+            self.api_event_callback = None
+
+        def login(self, *, api_key, secret_key) -> None:
+            return None
+
+        def logout(self) -> None:
+            return None
+
+        def snapshots(self, contracts) -> list[object]:
+            return []
+
+        def on_event(self, callback):
+            self.api_event_callback = callback
+            return callback
+
+    fake_api = _FakeApi()
+    fake_sj = types.SimpleNamespace(Shioaji=lambda simulation=False: fake_api)
+    fake_constant = types.SimpleNamespace(
+        QuoteType=types.SimpleNamespace(Tick="Tick", BidAsk="BidAsk"),
+        QuoteVersion=types.SimpleNamespace(v1="v1"),
+    )
+
+    monkeypatch.setitem(sys.modules, "shioaji", fake_sj)
+    monkeypatch.setitem(sys.modules, "shioaji.constant", fake_constant)
+    monkeypatch.setattr(bridge, "_load_twse_seed_quotes", lambda symbols: {})
+
+    collector = SinopacCollector(
+        ["2330"],
+        api_key="demo",
+        secret_key="demo",
+        bootstrap_bar_limit=0,
+    )
+    collector._loop = _FakeLoop()
+    reconnect_calls: list[str] = []
+    collector._request_reconnect = lambda reason: reconnect_calls.append(reason)  # type: ignore[method-assign]
+
+    collector._login_and_subscribe_sync()
+    assert fake_api.api_event_callback is not None
+
+    fake_api.api_event_callback(401, 0, "auth", "Token is expired")
+
+    assert reconnect_calls == ["quote_event_token_expired"]
 
 
 def test_sinopac_collector_login_and_subscribe_sync_skips_taiex_when_indices_contracts_are_unavailable(
@@ -1143,6 +1453,12 @@ def test_sinopac_collector_login_and_subscribe_sync_skips_taiex_when_indices_con
     )
     collector._loop = _FakeLoop()
 
+    class _FakeAutoTrader:
+        def get_required_symbols(self) -> list[str]:
+            return ["2330"]
+
+    collector._auto_trader = _FakeAutoTrader()
+
     with caplog.at_level(logging.WARNING):
         collector._login_and_subscribe_sync()
 
@@ -1153,6 +1469,31 @@ def test_sinopac_collector_login_and_subscribe_sync_skips_taiex_when_indices_con
     ]
     assert "TAIEX index subscription failed" not in caplog.text
     assert "hook unavailable" not in caplog.text
+
+
+def test_login_with_retry_sync_refreshes_contracts_after_login() -> None:
+    class _FakeApi:
+        def __init__(self) -> None:
+            self.logged_in = None
+            self.fetch_contract_calls: list[tuple[bool, int]] = []
+
+        def login(self, *, api_key, secret_key) -> None:
+            self.logged_in = (api_key, secret_key)
+
+        def fetch_contracts(self, *, contract_download, contracts_timeout) -> None:
+            self.fetch_contract_calls.append((contract_download, contracts_timeout))
+
+    collector = SinopacCollector(
+        ["2330"],
+        api_key="demo",
+        secret_key="demo",
+    )
+    fake_api = _FakeApi()
+
+    collector._login_with_retry_sync(fake_api)
+
+    assert fake_api.logged_in == ("demo", "demo")
+    assert fake_api.fetch_contract_calls == [(True, 120000)]
 
 
 def test_sinopac_collector_unsubscribes_quote_detail() -> None:

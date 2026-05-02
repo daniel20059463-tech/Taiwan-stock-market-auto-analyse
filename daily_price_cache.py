@@ -57,6 +57,17 @@ class DailyPriceCache:
             dates = [d for d in dates if d <= as_of_date]
         return [self._data[symbol][d].close for d in dates[-n:]]
 
+    def get_bars(
+        self,
+        symbol: str,
+        as_of_date: str | None = None,
+        n: int = 60,
+    ) -> list[DailyBar]:
+        dates = sorted(self._data.get(symbol, {}).keys())
+        if as_of_date:
+            dates = [d for d in dates if d <= as_of_date]
+        return [self._data[symbol][d] for d in dates[-n:]]
+
     def ma(
         self,
         symbol: str,
@@ -115,6 +126,28 @@ class DailyPriceCache:
             )
             true_ranges.append(tr)
         return sum(true_ranges) / period
+
+    def average_volume(
+        self,
+        symbol: str,
+        period: int = 20,
+        as_of_date: str | None = None,
+    ) -> float | None:
+        bars = self.get_bars(symbol, as_of_date=as_of_date, n=period)
+        if len(bars) < period:
+            return None
+        return sum(bar.volume for bar in bars) / period
+
+    def average_value(
+        self,
+        symbol: str,
+        period: int = 20,
+        as_of_date: str | None = None,
+    ) -> float | None:
+        bars = self.get_bars(symbol, as_of_date=as_of_date, n=period)
+        if len(bars) < period:
+            return None
+        return sum(bar.close * bar.volume for bar in bars) / period
 
     def has_enough_data(self, symbol: str, min_bars: int) -> bool:
         return len(self._data.get(symbol, {})) >= min_bars

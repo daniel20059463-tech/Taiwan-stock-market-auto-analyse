@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
+import urllib.error
+
+import pytest
+
 from daily_reporter import DailyReporter
+from daily_reporter import telegram_sender_from_env
 
 
 def _sample_day_payload() -> dict:
     return {
+        "source": "runtime_eod",
         "date": "2026-04-04",
         "tradeCount": 4,
         "winRate": 50.0,
@@ -79,7 +86,7 @@ def test_daily_reporter_generates_llm_report_from_top_trades() -> None:
     assert "單筆檢討：2330 take_profit" in result.text
     assert sent
     assert sent[0][0] == 123
-    assert sent[0][2] == "Markdown"
+    assert sent[0][2] == ""
 
 
 def test_daily_reporter_falls_back_to_template_when_llm_fails() -> None:
@@ -123,3 +130,55 @@ def test_daily_reporter_respects_telegram_length_limit() -> None:
     assert len(result.text) <= 4096
     assert sent
     assert len(sent[0]) <= 4096
+
+
+def test_telegram_sender_raises_when_all_retries_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = telegram_sender_from_env(bot_token="token", timeout_seconds=0.1)
+    calls: list[int] = []
+
+    def _boom(request, timeout):  # type: ignore[no-untyped-def]
+        calls.append(timeout)
+        raise urllib.error.URLError("timeout")
+
+    monkeypatch.setattr("urllib.request.urlopen", _boom)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="telegram_send_failed"):
+        sender(chat_id=1, text="hello", parse_mode="")
+
+    assert len(calls) == 3
+
+
+def test_telegram_sender_omits_parse_mode_when_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = telegram_sender_from_env(bot_token="token", timeout_seconds=0.1)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"ok": True, "result": {"message_id": 1}}).encode("utf-8")
+
+    def _ok(request, timeout):  # type: ignore[no-untyped-def]
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", _ok)
+
+    sender(chat_id=1, text="hello", parse_mode="")
+
+    assert "parse_mode" not in captured["body"]
+
+
+def test_daily_reporter_rejects_non_runtime_payload() -> None:
+    reporter = DailyReporter(chat_id=123, telegram_sender=lambda **_: None, llm_client=object())
+
+    payload = _sample_day_payload()
+    payload["source"] = "manual_test"
+
+    with pytest.raises(RuntimeError, match="daily_report_invalid_source"):
+        reporter.build_and_send(day_payload=payload)

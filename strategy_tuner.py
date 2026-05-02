@@ -21,7 +21,6 @@ _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 
 _DEFAULTS: dict[str, float] = {
     "BUY_SIGNAL_PCT": 2.0,
-    "SHORT_SIGNAL_PCT": -1.5,
     "TRAIL_STOP_ATR_MULT": 2.0,
     "VOLUME_CONFIRM_MULT": 1.5,
 }
@@ -111,17 +110,7 @@ class StrategyTuner:
         if change:
             rec.changes.append(change)
 
-        short_trades = [t for t in trades if t["action"] == "COVER"]
-        change = self._tune_entry_threshold(
-            short_trades,
-            param_name="SHORT_SIGNAL_PCT",
-            current_value=current_params["SHORT_SIGNAL_PCT"],
-            direction="short",
-        )
-        if change:
-            rec.changes.append(change)
-
-        all_closed = [t for t in trades if t["action"] in {"SELL", "COVER"}]
+        all_closed = [t for t in trades if t["action"] == "SELL"]
         change = self._tune_trail_stop_mult(
             all_closed,
             current_value=current_params["TRAIL_STOP_ATR_MULT"],

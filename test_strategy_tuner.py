@@ -70,8 +70,7 @@ def test_load_params_reads_existing_file(tmp_path) -> None:
         params = StrategyTuner.load_params()
         assert params["BUY_SIGNAL_PCT"] == 3.0
         assert params["TRAIL_STOP_ATR_MULT"] == 2.5
-        # Missing keys filled from defaults
-        assert params["SHORT_SIGNAL_PCT"] == _DEFAULTS["SHORT_SIGNAL_PCT"]
+        assert params["VOLUME_CONFIRM_MULT"] == _DEFAULTS["VOLUME_CONFIRM_MULT"]
     finally:
         st_module._PARAMS_FILE = original
 

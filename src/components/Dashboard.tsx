@@ -11,6 +11,7 @@ import {
 } from "../store";
 import type { Candle, InstrumentDefinition, SymbolSnapshot, WorkerInboundMessage } from "../types/market";
 import { postWorkerMessage } from "../workerBridge";
+import { NewsPanel } from "./NewsPanel";
 
 const palette = {
   bg: "#0a0d12",
@@ -341,24 +342,6 @@ function HeaderMetric({ label, value, color }: { label: string; value: string; c
   );
 }
 
-function ActionButton({ label, color }: { label: string; color: string }) {
-  return (
-    <button
-      type="button"
-      style={{
-        border: "none",
-        background: color,
-        color: "#ffffff",
-        fontWeight: 800,
-        fontSize: "16px",
-        cursor: "pointer",
-        borderRadius: "6px",
-      }}
-    >
-      {label}
-    </button>
-  );
-}
 
 export interface DashboardProps {
   symbols: string[];
@@ -809,7 +792,7 @@ export function Dashboard({
         boxSizing: "border-box",
         fontFamily: "var(--font-sans)",
         display: "grid",
-        gridTemplateRows: "74px minmax(0, 1fr)",
+        gridTemplateRows: "74px minmax(0, 1fr) 110px",
         gap: "10px",
         overflow: "hidden",
       }}
@@ -1228,41 +1211,35 @@ export function Dashboard({
             style={{
               padding: "8px 14px",
               display: "grid",
-              gridTemplateColumns: "104px 104px 1fr 1fr",
-              gap: "8px",
+              gridTemplateColumns: "1fr auto",
+              gap: "12px",
+              alignItems: "center",
+              borderTop: `1px solid ${palette.border}`,
             }}
           >
-            <ActionButton label="買進" color={palette.up} />
-            <ActionButton label="賣出" color={palette.down} />
-            <button
-              type="button"
-              style={{
-                border: `1px solid ${palette.border}`,
-                background: palette.panelSoft,
-                color: palette.text,
-                fontWeight: 700,
-                borderRadius: "6px",
-                cursor: "pointer",
-              }}
-            >
-              加入自選
-            </button>
-            <button
-              type="button"
-              style={{
-                border: `1px solid ${palette.border}`,
-                background: palette.panelSoft,
-                color: palette.text,
-                fontWeight: 700,
-                borderRadius: "6px",
-                cursor: "pointer",
-              }}
-            >
-              警示設定
-            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span
+                style={{
+                  width: "8px",
+                  height: "8px",
+                  borderRadius: "50%",
+                  background: palette.up,
+                  display: "inline-block",
+                  boxShadow: `0 0 6px ${palette.up}`,
+                }}
+              />
+              <span style={{ fontSize: "12px", color: palette.muted }}>
+                策略自動執行中 — 所有買賣由後端 AutoTrader 依策略條件觸發
+              </span>
+            </div>
+            <span style={{ fontSize: "11px", color: palette.muted, fontFamily: "monospace" }}>
+              {selectedRow?.symbol ?? "—"}
+            </span>
           </div>
         </section>
       </div>
+
+      <NewsPanel />
     </div>
   );
 }

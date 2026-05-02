@@ -1,0 +1,65 @@
+import type { BacktestLeaderboardPayload } from "./backtestLeaderboardModel";
+
+export const backtestLeaderboardFixture: BacktestLeaderboardPayload = {
+  generated_at: "2026-04-23T00:10:00+08:00",
+  period: "2026-01-22 -> 2026-04-22",
+  mode: "retail_flow_swing",
+  results: [
+    {
+      symbol: "4960",
+      name: "誠美材",
+      start_date: "2026-01-22",
+      end_date: "2026-04-22",
+      mode: "retail_flow_swing",
+      total_trades: 4,
+      win_trades: 3,
+      loss_trades: 1,
+      win_rate: 75,
+      total_pnl: 48210,
+      avg_pnl_per_trade: 12052.5,
+      max_drawdown_pct: 0.94,
+      trade_records: [
+        { symbol: "4960", action: "BUY", price: 36.2, shares: 1000, pnl: 0, reason: "ENTRY" },
+        { symbol: "4960", action: "SELL", price: 38.8, shares: 1000, pnl: 2600, reason: "TRAIL_STOP" },
+        { symbol: "4960", action: "BUY", price: 39.1, shares: 1000, pnl: 0, reason: "ENTRY" },
+        { symbol: "4960", action: "SELL", price: 41.6, shares: 1000, pnl: 2500, reason: "TIME_EXIT" },
+      ],
+    },
+    {
+      symbol: "1802",
+      name: "台玻",
+      start_date: "2026-01-22",
+      end_date: "2026-04-22",
+      mode: "retail_flow_swing",
+      total_trades: 3,
+      win_trades: 2,
+      loss_trades: 1,
+      win_rate: 66.7,
+      total_pnl: 21430,
+      avg_pnl_per_trade: 7143.3,
+      max_drawdown_pct: 0.86,
+      trade_records: [
+        { symbol: "1802", action: "BUY", price: 25.1, shares: 1000, pnl: 0, reason: "ENTRY" },
+        { symbol: "1802", action: "SELL", price: 26.0, shares: 1000, pnl: 900, reason: "FLOW_WEAKENED" },
+        { symbol: "1802", action: "BUY", price: 25.7, shares: 1000, pnl: 0, reason: "ENTRY" },
+      ],
+    },
+    {
+      symbol: "3231",
+      name: "緯創",
+      start_date: "2026-01-22",
+      end_date: "2026-04-22",
+      mode: "retail_flow_swing",
+      total_trades: 0,
+      win_trades: 0,
+      loss_trades: 0,
+      win_rate: 0,
+      total_pnl: 0,
+      avg_pnl_per_trade: 0,
+      max_drawdown_pct: 0,
+      trade_records: [],
+    },
+  ],
+};
+
+export default backtestLeaderboardFixture;

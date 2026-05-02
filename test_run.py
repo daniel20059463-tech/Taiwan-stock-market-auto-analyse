@@ -6,6 +6,8 @@ import types
 from dataclasses import is_dataclass
 from pathlib import Path
 
+import pytest
+
 from institutional_flow_provider import InstitutionalFlowRow
 from market_universe import DEFAULT_TW_SYMBOLS
 
@@ -149,6 +151,24 @@ def test_build_runtime_components_honors_explicit_raw_symbols_in_live_mode(monke
     assert is_dataclass(runtime)
     assert runtime.symbols == ["2330", "2317"]
     assert captured["symbols"] == ["2330", "2317"]
+
+
+def test_load_auto_trader_defaults_to_retail_flow_swing(monkeypatch) -> None:
+    run = importlib.import_module("run")
+    captured: dict[str, object] = {}
+
+    def fake_load_auto_trader(enabled: bool, *, strategy_mode: str, build_strategy_dependencies_fn, prime_institutional_flow_cache_fn):
+        captured["enabled"] = enabled
+        captured["strategy_mode"] = strategy_mode
+        captured["build_strategy_dependencies_fn"] = build_strategy_dependencies_fn
+        captured["prime_institutional_flow_cache_fn"] = prime_institutional_flow_cache_fn
+        return None
+
+    monkeypatch.setattr(run, "_runtime_bootstrap", types.SimpleNamespace(load_auto_trader=fake_load_auto_trader))
+
+    assert run._load_auto_trader(True) is None
+    assert captured["enabled"] is True
+    assert captured["strategy_mode"] == "retail_flow_swing"
 
 
 def test_resolve_runtime_symbols_falls_back_to_default_symbols_when_dynamic_load_fails() -> None:
@@ -536,6 +556,13 @@ def test_strategy_runtime_builds_retail_flow_swing_dependencies(monkeypatch) -> 
     assert isinstance(dependencies["institutional_flow_cache"], _FakeCache)
     assert isinstance(dependencies["retail_flow_strategy"], _FakeStrategy)
     assert dependencies["strategy_mode"] == "retail_flow_swing"
+
+
+def test_strategy_runtime_rejects_unsupported_strategy_mode() -> None:
+    strategy_runtime = importlib.import_module("strategy_runtime")
+
+    with pytest.raises(ValueError, match="Unsupported STRATEGY_MODE"):
+        strategy_runtime.build_strategy_dependencies("intraday")
 
 
 def test_strategy_runtime_primes_institutional_flow_cache(monkeypatch, tmp_path) -> None:

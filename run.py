@@ -8,6 +8,7 @@ import os
 from typing import Any
 
 from dotenv import load_dotenv
+from formal_simulation import run_formal_simulation_preflight
 from market_calendar import is_known_open_trading_datetime
 
 from main import create_supervisor_from_runtime
@@ -76,7 +77,7 @@ def _inject_daily_price_cache(auto_trader: Any, symbols: list[str]) -> None:
     _runtime_bootstrap.inject_daily_price_cache(auto_trader, symbols)
 
 
-def _load_auto_trader(enabled: bool, *, strategy_mode: str = "intraday") -> Any | None:
+def _load_auto_trader(enabled: bool, *, strategy_mode: str = "retail_flow_swing") -> Any | None:
     return _runtime_bootstrap.load_auto_trader(
         enabled,
         strategy_mode=strategy_mode,
@@ -112,6 +113,16 @@ async def main() -> None:
     if not use_mock and not is_known_open_trading_datetime():
         logger.warning("Skipping live engine startup: today is not a confirmed TWSE trading day.")
         return
+    if not use_mock:
+        preflight = run_formal_simulation_preflight()
+        if not preflight.ok:
+            logger.error("Formal simulation preflight failed: %s", "; ".join(preflight.errors))
+            return
+        logger.info(
+            "Formal simulation preflight passed capital=%.0f sector=%s",
+            preflight.account_capital,
+            preflight.latest_sector_trade_date or "missing",
+        )
 
     runtime = build_runtime_components(
         raw_symbols=raw_symbols,

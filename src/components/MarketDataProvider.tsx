@@ -2,6 +2,7 @@ import { startTransition, useEffect, type ReactNode } from "react";
 import { getBackendStatus, isDesktopRuntime } from "../desktopBridge";
 import { checkForDesktopUpdate } from "../desktopUpdater";
 import { useMarketStore } from "../store";
+import type { NewsFeed } from "../store";
 import { bindWorker, postWorkerMessage } from "../workerBridge";
 import type {
   InstrumentDefinition,
@@ -35,6 +36,7 @@ export function MarketDataProvider({
   const setDesktopRuntimeAvailable = useMarketStore((state) => state.setDesktopRuntimeAvailable);
   const setDesktopBackendStatus = useMarketStore((state) => state.setDesktopBackendStatus);
   const setDesktopUpdate = useMarketStore((state) => state.setDesktopUpdate);
+  const setNewsFeed = useMarketStore((state) => state.setNewsFeed);
 
   const symbolsKey = symbols.join("|");
   const instrumentsKey = instruments.map((item) => item.symbol).join("|");
@@ -99,6 +101,12 @@ export function MarketDataProvider({
           timestamp: message.timestamp,
           rows: message.rows,
         });
+        return;
+      }
+
+      if ((message as { type: string }).type === "INTERNATIONAL_NEWS") {
+        const raw = message as unknown as NewsFeed & { type: string };
+        setNewsFeed({ updatedAt: raw.updatedAt, items: raw.items });
         return;
       }
 
