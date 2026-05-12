@@ -96,6 +96,9 @@ class SwingExitJudge:
                 exit_reason_code="flow_weakened",
             )
 
+        if sector_state is None:
+            logger.warning("SwingExitJudge %s sector_state is None (cache missing?); skipping sector gates", symbol)
+
         if sector_state == "exit" and holding_days >= FLOW_EXIT_MIN_DAYS:
             logger.info(
                 "SwingExitJudge %s exit (sector_exit) sector_state=%s holding_days=%d",

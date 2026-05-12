@@ -154,20 +154,111 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Multiplier applied to resolved execution slippage (default: 1.0)",
     )
+    parser.add_argument(
+        "--account-capital",
+        type=float,
+        default=None,
+        help="Account capital in TWD for position sizing (default: ACCOUNT_CAPITAL env or 1,000,000)",
+    )
     return parser.parse_args()
 
 
-def make_trader(mode: str, slippage_multiplier: float):
+def _fetch_tpex_flow_row(symbol: str, date_str: str):
+    """抓單日 TPEX 三大法人資料，回傳 InstitutionalFlowRow 或 None。"""
+    import urllib.request, json
+    from institutional_flow_provider import InstitutionalFlowRow
+    dt = datetime.date.fromisoformat(date_str)
+    roc_date = f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
+    url = (
+        "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
+        f"?type=Daily&sect=EW&response=json&date={roc_date}"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        tables = data.get("tables", [])
+        if not tables:
+            return None
+        for row in tables[0].get("data", []):
+            if str(row[0]).strip() != symbol:
+                continue
+            def p(x):
+                s = str(x).replace(",", "").strip()
+                return int(float(s)) if s else 0
+            return InstitutionalFlowRow(
+                symbol=symbol,
+                name=symbol,
+                foreign_net_buy=p(row[4]),
+                investment_trust_net_buy=p(row[13]),
+                major_net_buy=0,
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_twse_flow_row(symbol: str, date_str: str):
+    """抓單日 TWSE 三大法人資料，回傳 InstitutionalFlowRow 或 None。"""
+    import urllib.request, json
+    from institutional_flow_provider import InstitutionalFlowRow
+    dt = datetime.date.fromisoformat(date_str)
+    date_param = f"{dt.year}{dt.month:02d}{dt.day:02d}"
+    url = (
+        "https://www.twse.com.tw/fund/T86"
+        f"?response=json&date={date_param}&selectType=ALLBUT0999"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        for item in data.get("data", []):
+            if len(item) < 12 or str(item[0]).strip() != symbol:
+                continue
+            def p(x):
+                s = str(x).replace(",", "").strip()
+                return int(float(s)) if s else 0
+            return InstitutionalFlowRow(
+                symbol=symbol,
+                name=symbol,
+                foreign_net_buy=p(item[4]),
+                investment_trust_net_buy=p(item[10]),
+                major_net_buy=p(item[11]),
+            )
+    except Exception:
+        pass
+    return None
+
+
+def build_flow_cache(symbol: str, dates: list[str], is_tpex: bool):
+    """為指定 symbol 抓歷史三大法人，回傳 {date: [InstitutionalFlowRow]}。"""
+    from institutional_flow_cache import InstitutionalFlowCache
+    cache = InstitutionalFlowCache()
+    fetch_fn = _fetch_tpex_flow_row if is_tpex else _fetch_twse_flow_row
+    for date_str in dates:
+        row = fetch_fn(symbol, date_str)
+        if row:
+            cache.store(trade_date=date_str, rows=[row])
+        import time as _time
+        _time.sleep(0.3)
+    return cache
+
+
+def make_trader(mode: str, slippage_multiplier: float, flow_cache=None, account_capital: float | None = None):
     from auto_trader import AutoTrader
     from risk_manager import risk_manager_from_env
 
     risk = risk_manager_from_env()
+    if account_capital is not None:
+        from risk_manager import RiskManager
+        risk = RiskManager(account_capital=account_capital)
     return AutoTrader(
         telegram_token="",
         chat_id="",
         strategy_mode=mode,
         risk_manager=risk,
         slippage_multiplier=slippage_multiplier,
+        institutional_flow_cache=flow_cache,
     )
 
 
@@ -178,6 +269,7 @@ async def run(
     mode: str,
     keep_days: int,
     slippage_multiplier: float,
+    account_capital: float | None = None,
 ) -> None:
     from backtest import BacktestRunner
     from historical_data import TWSEHistoricalFetcher
@@ -204,11 +296,56 @@ async def run(
     except Exception as exc:
         print(f"  警告：無法抓取 0050（{exc}），大盤篩選器將停用。")
 
+    # 抓歷史三大法人籌碼（多抓 10 個交易日前的資料以建立 consecutive_trust_buy_days）
+    print("正在抓取三大法人籌碼資料 ...")
+    pre_start = (datetime.date.fromisoformat(start_date) - datetime.timedelta(days=20)).isoformat()
+    bar_dates = sorted({
+        datetime.datetime.fromtimestamp(b.ts_ms / 1000, tz=_TZ_TW).strftime("%Y-%m-%d")
+        for b in bars
+    })
+    # 產生 pre_start ~ start_date 之間的工作日（用來建 consecutive_trust_buy_days 基礎）
+    pre_dates: list[str] = []
+    cur = datetime.date.fromisoformat(pre_start)
+    end_pre = datetime.date.fromisoformat(start_date)
+    while cur < end_pre:
+        if cur.weekday() < 5:
+            pre_dates.append(cur.isoformat())
+        cur += datetime.timedelta(days=1)
+    all_flow_dates = pre_dates + bar_dates
+
+    # 判斷交易所（Yahoo Finance 成功抓到 .TWO 代表 TPEX）
+    is_tpex = True  # 先試 TPEX；若全部 miss 後面仍能運作只是沒籌碼
+    flow_cache = build_flow_cache(symbol, all_flow_dates, is_tpex)
+    if not flow_cache.available_dates():
+        print("  TPEX 無資料，改試 TWSE ...")
+        flow_cache = build_flow_cache(symbol, all_flow_dates, is_tpex=False)
+    flow_dates_loaded = len(flow_cache.available_dates())
+    print(f"  已載入 {flow_dates_loaded} 個交易日的籌碼資料。")
+
+    flow_rows_by_date = {
+        d: flow_cache.rows_for_date(d)
+        for d in flow_cache.available_dates()
+    }
+
+    # 自動估算最低所需資金（用最高收盤價確保整個回測期間都能買 1 張）
+    if account_capital is None and bars:
+        max_price = max(b.close for b in bars)
+        min_capital_needed = max_price * 1000 / 0.10  # 10% max_single_pos → 1 lot needs 10x price*1000
+        import os as _os
+        env_capital = float(_os.getenv("ACCOUNT_CAPITAL", "1000000"))
+        if env_capital < min_capital_needed:
+            account_capital = min_capital_needed
+            print(f"  提示：{symbol} 回測期最高 {max_price:.0f} 元，自動調整 account_capital={account_capital:,.0f}")
+
     print(f"已抓到 {len(bars)} 根 K 棒，開始執行 [{mode}] 回測 ...")
     runner = BacktestRunner(
-        auto_trader_factory=lambda: make_trader(mode, slippage_multiplier)
+        auto_trader_factory=lambda: make_trader(mode, slippage_multiplier, flow_cache, account_capital)
     )
-    result = await runner.run(bars=bars, market_index_by_date=market_index_by_date or None)
+    result = await runner.run(
+        bars=bars,
+        market_index_by_date=market_index_by_date or None,
+        flow_rows_by_date=flow_rows_by_date or None,
+    )
 
     sep = "=" * 52
     print(f"\n{sep}")
@@ -271,6 +408,7 @@ def main() -> None:
             args.mode,
             args.keep_days,
             args.slippage_multiplier,
+            args.account_capital,
         )
     )
 

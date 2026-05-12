@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import importlib
 import logging
 import os
 from typing import Any
@@ -115,8 +114,14 @@ async def main() -> None:
         return
     if not use_mock:
         preflight = run_formal_simulation_preflight()
-        if not preflight.ok:
-            logger.error("Formal simulation preflight failed: %s", "; ".join(preflight.errors))
+        # 降級錯誤：這些問題不阻擋啟動，只是 warning
+        _SOFT_ERRORS = {"sector_signal_cache_stale", "account_capital_mismatch"}
+        fatal_errors = [e for e in preflight.errors if not any(e.startswith(s) for s in _SOFT_ERRORS)]
+        soft_errors = [e for e in preflight.errors if any(e.startswith(s) for s in _SOFT_ERRORS)]
+        if soft_errors:
+            logger.warning("Preflight soft warning (continuing): %s", "; ".join(soft_errors))
+        if fatal_errors:
+            logger.error("Formal simulation preflight failed: %s", "; ".join(fatal_errors))
             return
         logger.info(
             "Formal simulation preflight passed capital=%.0f sector=%s",

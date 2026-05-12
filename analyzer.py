@@ -14,8 +14,6 @@ from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
 from multiprocessing.shared_memory import SharedMemory
 from queue import Empty, Full
-from typing import Any
-
 
 def _now() -> float:
     return time.time()

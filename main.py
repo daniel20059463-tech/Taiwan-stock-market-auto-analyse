@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import sys
 import time
 from dataclasses import dataclass
 from enum import Enum

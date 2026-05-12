@@ -35,11 +35,13 @@ _LIMIT_DOWN_PCT = -9.5
 _TAIEX_SYMBOL = "TSE001"          # 加權指數在 shioaji 的合約代號
 _LOGIN_RETRY_DELAYS = (5.0, 15.0, 65.0)
 _DEFAULT_WATCHDOG_CHECK_SECONDS = 10.0
-_DEFAULT_TICK_STALE_SECONDS = 45.0
+_DEFAULT_TICK_STALE_SECONDS = 90.0
 _MIN_WATCHDOG_CHECK_SECONDS = 1.0
 _MIN_TICK_STALE_SECONDS = 5.0
 _DEFAULT_AUTH_PROBE_SECONDS = 20.0
 _MIN_AUTH_PROBE_SECONDS = 5.0
+_MAX_PROBE_ERRORS_BEFORE_RECONNECT = 3   # 連續 probe error 幾次就強制重連
+_MAX_RECONNECT_FAILURES = 3              # 重連連續失敗幾次就重啟 process
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -195,9 +197,10 @@ class SinopacCollector:
         self._taiex_prev_close: float = 0.0   # 加權指數前收（用於計算漲跌幅）
         self._last_tick_monotonic: float = 0.0
         self._watchdog_task: asyncio.Task[None] | None = None
-        self._watchdog_thread: threading.Thread | None = None
         self._watchdog_settings = _build_watchdog_settings()
         self._last_auth_probe_monotonic: float = 0.0
+        self._consecutive_probe_errors: int = 0
+        self._consecutive_reconnect_failures: int = 0
         self._history_preload_processes: list[multiprocessing.Process] = []
         self._history_preload_inflight: set[str] = set()
         self._reconnecting: bool = False
@@ -285,12 +288,6 @@ class SinopacCollector:
         await self._loop.run_in_executor(None, self._login_and_subscribe_sync)
         self._last_tick_monotonic = time.monotonic()
         self._watchdog_task = asyncio.create_task(self._watchdog_loop(), name="sinopac-watchdog")
-        self._watchdog_thread = threading.Thread(
-            target=self._watchdog_sync_loop,
-            name="sinopac-watchdog-sync",
-            daemon=True,
-        )
-        self._watchdog_thread.start()
         logger.info("SinopacCollector ready on ws://%s:%d symbols=%s", self._ws_host, self._ws_port, self._symbols)
 
     async def stop_accepting(self) -> None:
@@ -354,12 +351,30 @@ class SinopacCollector:
                             probe_status = "error"
                         if probe_status == "token_expired":
                             logger.warning("Auth probe detected expired token; triggering reconnect")
+                            self._consecutive_probe_errors = 0
                             try:
                                 await self._loop.run_in_executor(None, self._reconnect_sync)
                                 logger.info("Shioaji reconnect completed after auth probe expiry")
                             except Exception as exc:
                                 logger.error("Shioaji reconnect failed after auth probe expiry: %s", exc)
                             continue
+                        elif probe_status == "error":
+                            self._consecutive_probe_errors += 1
+                            logger.debug("Auth probe error count=%d", self._consecutive_probe_errors)
+                            if self._consecutive_probe_errors >= _MAX_PROBE_ERRORS_BEFORE_RECONNECT:
+                                logger.warning(
+                                    "Auth probe returned error %d consecutive times; forcing reconnect",
+                                    self._consecutive_probe_errors,
+                                )
+                                self._consecutive_probe_errors = 0
+                                try:
+                                    await self._loop.run_in_executor(None, self._reconnect_sync)
+                                    logger.info("Shioaji reconnect completed after repeated probe errors")
+                                except Exception as exc:
+                                    logger.error("Shioaji reconnect failed after probe errors: %s", exc)
+                                continue
+                        else:
+                            self._consecutive_probe_errors = 0
                 elapsed = time.monotonic() - self._last_tick_monotonic
                 if not _should_watchdog_reconnect(
                     now_tw=now_tw,
@@ -382,55 +397,9 @@ class SinopacCollector:
                     logger.error("永豐 API 重新連線失敗: %s", exc)
         except asyncio.CancelledError:
             return
-        except Exception as exc:
+        except BaseException as exc:
             logger.error("async watchdog crashed: %s", exc)
             return
-
-    def _watchdog_sync_loop(self) -> None:
-        check_interval = self._watchdog_settings["check_interval_seconds"]
-        tick_stale_seconds = self._watchdog_settings["tick_stale_seconds"]
-        auth_probe_seconds = self._watchdog_settings["auth_probe_seconds"]
-
-        while self._accepting:
-            time.sleep(check_interval)
-            if not self._accepting or self._reconnecting:
-                continue
-            now_tw = datetime.datetime.now(tz=_TZ_TW)
-            trading_minute = now_tw.hour * 60 + now_tw.minute
-            in_market_hours = _MARKET_OPEN_MIN <= trading_minute <= _MARKET_CLOSE_MIN
-
-            if in_market_hours and time.monotonic() - self._last_auth_probe_monotonic >= auth_probe_seconds:
-                self._last_auth_probe_monotonic = time.monotonic()
-                symbol = next(iter(self.visible_symbols or self._symbols), None)
-                contract = self._get_contract_sync(symbol) if symbol else None
-                probe_status = _probe_api_health_sync(api=self._api, contract=contract)
-                if probe_status == "token_expired":
-                    logger.warning("Auth probe detected expired token; triggering reconnect")
-                    try:
-                        self._reconnect_sync()
-                        logger.info("Shioaji reconnect completed after auth probe expiry")
-                    except Exception as exc:
-                        logger.error("Shioaji reconnect failed after auth probe expiry: %s", exc)
-                    continue
-
-            elapsed = time.monotonic() - self._last_tick_monotonic
-            if not _should_watchdog_reconnect(
-                now_tw=now_tw,
-                elapsed_seconds=elapsed,
-                tick_stale_seconds=tick_stale_seconds,
-            ):
-                continue
-
-            logger.warning(
-                "交易時段內 %.0f 秒無 tick，sync watchdog 觸發重連（timeout=%.0f 秒）",
-                elapsed,
-                tick_stale_seconds,
-            )
-            try:
-                self._reconnect_sync()
-                logger.info("永豐 API 重新連線成功（sync watchdog）")
-            except Exception as exc:
-                logger.error("永豐 API 重新連線失敗（sync watchdog）: %s", exc)
 
     def _reconnect_sync(self) -> None:
         """斷線重連：登出舊 API → 重新 login + subscribe。"""
@@ -445,8 +414,48 @@ class SinopacCollector:
                     self._api = None
                 self._login_and_subscribe_sync()
                 self._last_tick_monotonic = time.monotonic()
+                self._consecutive_reconnect_failures = 0
+            except Exception:
+                self._consecutive_reconnect_failures += 1
+                logger.error(
+                    "Reconnect failed (attempt %d/%d)",
+                    self._consecutive_reconnect_failures,
+                    _MAX_RECONNECT_FAILURES,
+                )
+                if self._consecutive_reconnect_failures >= _MAX_RECONNECT_FAILURES:
+                    self._restart_process()
+                raise
             finally:
                 self._reconnecting = False
+
+    def _restart_process(self) -> None:
+        """重啟整個 process，清除 pysolace 壞掉的底層 transport 狀態。
+        使用 os._exit() 確保從任何執行緒呼叫都能立即終止 process。
+        """
+        import os
+        import subprocess
+        import sys
+        import time
+        logger.critical(
+            "Restarting process after %d consecutive reconnect failures",
+            self._consecutive_reconnect_failures,
+        )
+        spawned = False
+        try:
+            proc = subprocess.Popen([sys.executable] + sys.argv)
+            spawned = True
+            logger.critical("Spawned replacement process pid=%d", proc.pid)
+        except Exception as exc:
+            logger.critical(
+                "Failed to spawn restart process: %s — exiting without replacement; "
+                "expect external supervisor (Task Scheduler / systemd) to restart",
+                exc,
+            )
+        # 給 logger handler 時間把最後的 critical 訊息寫到磁碟
+        time.sleep(0.5)
+        if not spawned:
+            logger.critical("Exiting (no replacement spawned)")
+        os._exit(1)
 
     def _offer_tick(self, payload: dict[str, Any]) -> None:
         symbol = str(payload.get("symbol", ""))
@@ -1688,12 +1697,6 @@ def _is_ordinary_stock_contract(contract: Any) -> bool:
     ]
     text = " ".join(fields).upper()
     return not any(marker in text for marker in _NON_ORDINARY_STOCK_MARKERS)
-
-
-def load_shioaji_stock_universe(api: Any) -> dict[str, dict[str, Any]]:
-    from quote_runtime.universe_loader import load_shioaji_stock_universe as _load_shioaji_stock_universe
-
-    return _load_shioaji_stock_universe(api)
 
 
 def collector_from_env(

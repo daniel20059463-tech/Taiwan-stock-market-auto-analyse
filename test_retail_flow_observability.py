@@ -285,6 +285,67 @@ async def test_retail_flow_strategy_skips_financial_sector_symbols() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retail_flow_strategy_marks_position_size_below_min_lot_before_sector_limit() -> None:
+    cache = InstitutionalFlowCache()
+    cache.store(
+        trade_date="2026-04-20",
+        rows=[
+            InstitutionalFlowRow(
+                symbol="2454",
+                name="聯發科",
+                foreign_net_buy=1500,
+                investment_trust_net_buy=600,
+                major_net_buy=900,
+            )
+        ],
+    )
+
+    class _ZeroShareRiskManager(_FakeRiskManager):
+        def calc_position_shares(self, price: float, stop_price: float, lot_size: int = 1000) -> int:
+            return 0
+
+    trader = AutoTrader(
+        telegram_token="",
+        chat_id="",
+        risk_manager=_ZeroShareRiskManager(),
+        strategy_mode="retail_flow_swing",
+        retail_flow_strategy=RetailFlowSwingStrategy(),
+        institutional_flow_cache=cache,
+    )
+
+    class _FakeExecution:
+        def __init__(self) -> None:
+            self.buy_calls: list[dict[str, object]] = []
+
+        async def execute_buy(self, **kwargs) -> None:
+            self.buy_calls.append(kwargs)
+
+    fake_execution = _FakeExecution()
+    trader._execution = fake_execution
+    trader._is_volume_confirmed = types.MethodType(lambda self, symbol: True, trader)
+    trader._is_above_ma10 = types.MethodType(lambda self, symbol, price: True, trader)
+    trader._swing_trade_date = types.MethodType(lambda self: "2026-04-20", trader)
+    trader._passes_relative_strength_filter = types.MethodType(lambda self, symbol: True, trader)
+    trader._passes_market_regime = types.MethodType(lambda self: True, trader)
+    trader._passes_liquidity_filter = types.MethodType(lambda self, symbol: True, trader)
+    trader._retail_flow_strategy.classify_watch_state = lambda **kwargs: "ready_to_buy"
+    trader._retail_flow_strategy.should_enter_position = lambda **kwargs: True
+    trader.set_symbol_sector("2454", "半導體")
+
+    await trader._evaluate_retail_flow_entry(
+        symbol="2454",
+        price=2870.0,
+        change_pct=2.0,
+        ts_ms=int(datetime.datetime(2026, 4, 21, 9, 5, tzinfo=datetime.timezone(datetime.timedelta(hours=8))).timestamp() * 1000),
+        payload={"symbol": "2454", "sector": "半導體"},
+    )
+
+    assert trader.get_retail_flow_watch_state("2454") == "ready_to_buy"
+    assert trader.get_retail_flow_last_non_entry_reason("2454") == "position_size_below_min_lot"
+    assert fake_execution.buy_calls == []
+
+
+@pytest.mark.asyncio
 async def test_retail_flow_strategy_skips_low_liquidity_symbols() -> None:
     cache = InstitutionalFlowCache()
     cache.store(

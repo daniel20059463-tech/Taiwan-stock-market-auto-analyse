@@ -195,6 +195,12 @@ def test_calc_position_shares_floor_when_risk_per_share_zero():
     assert shares == 1000  # falls back to lot_size
 
 
+def test_calc_position_shares_returns_zero_when_one_lot_exceeds_single_position_cap():
+    rm = make_rm(account_capital=1_000_000.0, max_single_pos_pct=10.0)
+    shares = rm.calc_position_shares(entry_price=332.5, stop_price=320.03)
+    assert shares == 0
+
+
 # ---------------------------------------------------------------------------
 # calc_target_price
 # ---------------------------------------------------------------------------

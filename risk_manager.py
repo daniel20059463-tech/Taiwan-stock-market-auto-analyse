@@ -182,15 +182,18 @@ class RiskManager:
         - 下限 1 張，上限受 max_single_position 約束
         """
         risk_per_share = entry_price - stop_price
+        max_shares_by_capital = int(self.max_single_position / entry_price // lot_size) * lot_size
+        if max_shares_by_capital < lot_size:
+            return 0
         if risk_per_share <= 0:
-            return lot_size
+            return max_shares_by_capital
 
         risk_amount = self.account_capital * self.risk_pct_per_trade / 100
         shares_raw = risk_amount / risk_per_share
-        shares = max(lot_size, int(shares_raw // lot_size) * lot_size)
-
-        max_shares_by_capital = int(self.max_single_position / entry_price // lot_size) * lot_size
-        shares = min(shares, max(lot_size, max_shares_by_capital))
+        shares = int(shares_raw // lot_size) * lot_size
+        if shares < lot_size:
+            return 0
+        shares = min(shares, max_shares_by_capital)
 
         return shares
 

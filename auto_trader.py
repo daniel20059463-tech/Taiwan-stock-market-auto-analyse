@@ -12,7 +12,6 @@ from dataclasses import replace
 import datetime
 import json
 import logging
-import math
 import os
 import time
 import uuid
@@ -31,7 +30,6 @@ from multi_analyst import (
 from retail_flow_strategy import RetailFlowSwingStrategy
 from trading.paper_execution import PaperExecutionService
 from trading import (
-    CandleBar,
     DecisionFactor,
     DecisionReport,
     MarketState,
@@ -47,6 +45,8 @@ logger = logging.getLogger(__name__)
 # Signal thresholds
 BUY_SIGNAL_PCT = 2.0
 OPENING_BREAKOUT_PCT = 1.0   # Lower threshold for the 09:00–09:30 opening window
+SHORT_SIGNAL_PCT = -3.0       # 跌幅需達此值（負數）才觸發放空評估
+SHORT_SENTIMENT_THRESHOLD = 0.0  # 輿情分數需低於此值才允許放空
 NEAR_LIMIT_UP_PCT = 9.5
 LIMIT_LOCK_UP_PCT = 9.5    # 漲停鎖死判定門檻
 LIMIT_LOCK_DOWN_PCT = -9.5 # 跌停鎖死判定門檻
@@ -216,11 +216,15 @@ class AutoTrader:
     async def on_tick(self, payload: dict[str, Any]) -> None:
         if self._monitor_task is None:
             self._monitor_task = asyncio.create_task(self._monitor_loop(), name="autotrader-monitor")
-            
-        symbol: str = payload["symbol"]
-        price: float = float(payload["price"])
-        volume: int = int(payload.get("volume", 0))
-        ts_ms: int = int(payload["ts"])
+
+        try:
+            symbol: str = str(payload["symbol"])
+            price: float = float(payload["price"])
+            volume: int = int(payload.get("volume", 0))
+            ts_ms: int = int(payload["ts"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.error("on_tick: invalid payload fields: %s — payload=%s", exc, payload)
+            return
 
         self._last_tick_ts = time.time()
 
@@ -309,6 +313,13 @@ class AutoTrader:
             self._retail_flow_non_entry_reasons.clear()
             self._build_preopen_watchlist()
 
+    @staticmethod
+    def _pct_chg(new_price: float, base_price: float) -> float:
+        """Return (new_price - base_price) / base_price * 100, or 0.0 if base_price <= 0."""
+        if base_price <= 0:
+            return 0.0
+        return (new_price - base_price) / base_price * 100
+
     async def _check_overnight_gap(self, symbol: str, open_price: float, ts_ms: int) -> None:
         """
         換日後第一 tick：檢查開盤價是否跳空越過停損。
@@ -322,7 +333,7 @@ class AutoTrader:
             return
 
         if open_price < position.stop_price:
-            gap_pct = (open_price - position.entry_price) / position.entry_price * 100
+            gap_pct = self._pct_chg(open_price, position.entry_price)
             logger.warning(
                 "%s overnight gap-down: open=%.2f stop=%.2f entry=%.2f (%.2f%%)",
                 symbol, open_price, position.stop_price, position.entry_price, gap_pct,
@@ -850,13 +861,16 @@ class AutoTrader:
         atr = self._daily_atr(symbol)
         stop_price = self._risk.calc_stop_price(price, atr)
         shares = self._risk.calc_position_shares(price, stop_price)
-        allowed, reason = self._passes_sector_limits(sector, pending_notional=price * shares)
-        if not allowed:
-            self._set_retail_flow_non_entry_reason(symbol, reason)
+        if shares < SHARES_PER_LOT:
+            self._set_retail_flow_non_entry_reason(symbol, "position_size_below_min_lot")
             return
         allowed, _reason = self._risk.can_buy(symbol, price, shares, len(self._book.positions))
         if not allowed:
             self._set_retail_flow_non_entry_reason(symbol, "risk_rejected")
+            return
+        allowed, reason = self._passes_sector_limits(sector, pending_notional=price * shares)
+        if not allowed:
+            self._set_retail_flow_non_entry_reason(symbol, reason)
             return
 
         target_price = self._risk.calc_target_price(price, stop_price)
@@ -909,11 +923,7 @@ class AutoTrader:
         flow_weak_streak = self._consecutive_weak_flow_days(symbol, self._swing_trade_date(), n=3)
 
         holding_days = max(0, int((ts_ms - position.entry_ts) / 86_400_000))
-        pct_from_entry = (
-            (price - position.entry_price) / position.entry_price * 100
-            if position.entry_price
-            else 0.0
-        )
+        pct_from_entry = self._pct_chg(price, position.entry_price)
         sentiment_score = self._sentiment.get_score(symbol) if self._sentiment is not None else None
         ma10_gap_pct = self._ma10_gap_pct(symbol, price)
         daily_atr = self._daily_atr(symbol)
@@ -1228,13 +1238,16 @@ class AutoTrader:
             target_price,
             f"{atr:.4f}" if atr is not None else "N/A",
         )
+        await self._send(text)
 
     async def _check_exit(self, symbol: str, price: float, ts_ms: int) -> None:
         """Check exit conditions for a long position."""
         if self._limit_locked.get(symbol) == "down":
             return
-            
-        position = self._book.positions[symbol]
+
+        position = self._book.positions.get(symbol)
+        if position is None:
+            return
 
         if price > position.peak_price:
             position.peak_price = price
@@ -1268,129 +1281,13 @@ class AutoTrader:
             reason = "TAKE_PROFIT"
 
         if reason:
-            pct_from_entry = (price - position.entry_price) / position.entry_price * 100
+            pct_from_entry = self._pct_chg(price, position.entry_price)
             await self._execution.execute_sell(
                 symbol=symbol,
                 price=price,
                 reason=reason,
                 pct_from_entry=pct_from_entry,
                 ts_ms=ts_ms,
-            )
-
-    async def _paper_sell(
-        self,
-        symbol: str,
-        price: float,
-        reason: str,
-        pct_from_entry: float,
-        ts_ms: int,
-    ) -> None:
-        position = self._book.positions.pop(symbol)
-        gross_pnl = (price - position.entry_price) * position.shares
-        net_pnl = self._risk.calc_net_pnl(position.entry_price, price, position.shares)
-        final_reason = {
-            "STOP_LOSS": "stop_loss",
-            "TRAIL_STOP": "trailing_stop",
-            "TAKE_PROFIT": "take_profit",
-            "EOD": "end_of_day_exit",
-        }.get(reason, reason.lower())
-        risk_flag = {
-            "STOP_LOSS": "stop_hit",
-            "TRAIL_STOP": "trail_stop_hit",
-            "TAKE_PROFIT": "target_hit",
-            "EOD": "eod_flatten",
-        }.get(reason, "exit")
-        decision_report = self._append_decision_report(
-            DecisionReport(
-                report_id=f"{symbol}-sell-{ts_ms}",
-                symbol=symbol,
-                ts=ts_ms,
-                decision_type="sell",
-                trigger_type="risk" if reason in {"STOP_LOSS", "TRAIL_STOP", "EOD"} else "technical",
-                confidence=max(20, min(92, 60 + int(abs(pct_from_entry) * 4))),
-                final_reason=final_reason,
-                summary={
-                    "STOP_LOSS": "價格跌破保護價位，立即退出以控制單筆損失。",
-                    "TRAIL_STOP": "價格自高檔回落至追蹤停損，先保留已獲利部位。",
-                    "TAKE_PROFIT": "目標價到達，依計畫先落袋部分事件利潤。",
-                    "EOD": "收盤前平倉，避免隔夜事件風險。",
-                }.get(reason, "模擬部位已完成出場。"),
-                supporting_factors=[
-                    DecisionFactor("support", "出場條件", reason),
-                    DecisionFactor("support", "報酬變化", f"相對進場 {pct_from_entry:+.2f}%"),
-                ],
-                opposing_factors=[
-                    DecisionFactor("oppose", "放棄後續延伸", "提前出場可能錯過後續趨勢延續"),
-                ],
-                risk_flags=[risk_flag],
-                source_events=[
-                    {"source": "position_management", "entryPrice": round(position.entry_price, 2), "currentPrice": round(price, 2)}
-                ],
-                order_result={
-                    "status": "executed",
-                    "action": "SELL",
-                    "price": round(price, 2),
-                    "shares": position.shares,
-                    "pnl": round(net_pnl, 2),
-                },
-            )
-        )
-
-        record = TradeRecord(
-            symbol=symbol,
-            action="SELL",
-            price=execution_price,
-            shares=position.shares,
-            reason=reason,
-            pnl=net_pnl,
-            ts=ts_ms,
-            gross_pnl=gross_pnl,
-            decision_report=decision_report,
-        )
-        self._book.trade_history.append(record)
-
-        self._risk.on_sell(symbol, net_pnl)
-        await self._persist_trade(record)
-
-        icon = "停損" if reason in {"STOP_LOSS", "TRAIL_STOP"} else "停利" if reason == "TAKE_PROFIT" else "收盤"
-        reason_labels = {
-            "STOP_LOSS": "初始停損",
-            "TRAIL_STOP": "追蹤停損",
-            "TAKE_PROFIT": "目標停利",
-            "EOD": "收盤平倉",
-        }
-        tx_cost = gross_pnl - net_pnl
-        daily_pnl = self._risk.daily_pnl
-        text = "\n".join(
-            [
-                f"[模擬交易] {icon}出場",
-                f"標的：{symbol}",
-                f"原因：{reason_labels.get(reason, reason)}",
-                f"進場 / 出場：{position.entry_price:,.2f} / {price:,.2f} (滑價後: {execution_price:,.2f})",
-                f"相對報酬：{pct_from_entry:+.2f}%",
-                f"毛損益：{gross_pnl:+,.0f} 元",
-                f"交易成本：{tx_cost:,.0f} 元",
-                f"淨損益：{net_pnl:+,.0f} 元",
-                f"當日累計：{daily_pnl:+,.0f} 元",
-                f"時間：{_ms_to_time(ts_ms)}",
-            ]
-        )
-        logger.info(
-            "[PAPER SELL] %s @ %.2f reason=%s net_pnl=%.0f",
-            symbol,
-            price,
-            reason,
-            net_pnl,
-        )
-
-        if self._risk.is_halted:
-            await self._send(
-                f"[風控警示] 當日損益已達限制，今日累計 {daily_pnl:+,.0f} 元，系統暫停新倉。"
-            )
-        if self._risk.just_entered_cooldown:
-            await self._send(
-                f"[風控警示] 連續虧損 {self._risk.consecutive_losses + 1} 筆，"
-                "系統進入 1 小時冷卻期，暫停所有新開倉。"
             )
 
     # ── 系統健康監控 (Heartbeat & Stale Data) ───────────────────────────
@@ -1686,7 +1583,7 @@ class AutoTrader:
         shares = shares if shares is not None else self._shares
         
         # 模擬放空白價（賣得更便宜）
-        slippage_bps = self._resolve_slippage_bps(symbol, price=price, shares=partial_shares)
+        slippage_bps = self._resolve_slippage_bps(symbol, price=price, shares=shares)
         execution_price = round(price * (1 - slippage_bps / 10000), 2)
         
         position = PaperPosition(
@@ -1742,13 +1639,16 @@ class AutoTrader:
             "[PAPER SHORT] %s @ %.2f change=%.2f%% stop=%.2f target=%.2f",
             symbol, price, change_pct, stop_price, target_price,
         )
+        await self._send(text)
 
     async def _check_short_exit(self, symbol: str, price: float, ts_ms: int) -> None:
         """檢查空方出場條件（停損 / 停利）。不使用追蹤停利。"""
         if self._limit_locked.get(symbol) == "up":
             return
-            
-        position = self._book.positions[symbol]
+
+        position = self._book.positions.get(symbol)
+        if position is None:
+            return
         reason: Optional[str] = None
         if price >= position.stop_price:
             reason = "STOP_LOSS"
@@ -1756,7 +1656,7 @@ class AutoTrader:
             reason = "TAKE_PROFIT"
 
         if reason:
-            pct_from_entry = (position.entry_price - price) / position.entry_price * 100
+            pct_from_entry = self._pct_chg(position.entry_price, price)
             await self._execution.execute_cover(
                 symbol=symbol,
                 price=price,
@@ -1868,6 +1768,7 @@ class AutoTrader:
             "[PAPER COVER] %s @ %.2f reason=%s net_pnl=%.0f",
             symbol, price, reason, net_pnl,
         )
+        await self._send(text)
         if self._risk.just_entered_cooldown:
             await self._send(
                 f"[風控警示] 連續虧損 {self._risk.consecutive_losses + 1} 筆，"
@@ -1882,7 +1783,10 @@ class AutoTrader:
 
         logger.info("AutoTrader: EOD close triggered for %d open positions", len(symbols))
         for symbol in symbols:
-            position = self._book.positions[symbol]
+            position = self._book.positions.get(symbol)
+            if position is None:
+                logger.debug("EOD close: %s already removed from book, skipping", symbol)
+                continue
             if position.side == "long" and self._limit_locked.get(symbol) == "down":
                 await self._send(f"⚠️ [警告] {symbol} 跌停鎖死，EOD 模擬平倉可能失真！")
             elif position.side == "short" and self._limit_locked.get(symbol) == "up":
@@ -1890,7 +1794,7 @@ class AutoTrader:
 
             price = self._last_prices.get(symbol, position.entry_price)
             if position.side == "short":
-                pct = (position.entry_price - price) / position.entry_price * 100
+                pct = self._pct_chg(position.entry_price, price)
                 await self._execution.execute_cover(
                     symbol=symbol,
                     price=price,
@@ -1899,7 +1803,7 @@ class AutoTrader:
                     ts_ms=ts_ms,
                 )
             else:
-                pct = (price - position.entry_price) / position.entry_price * 100
+                pct = self._pct_chg(price, position.entry_price)
                 await self._execution.execute_sell(
                     symbol=symbol,
                     price=price,
@@ -2275,7 +2179,7 @@ class AutoTrader:
         if shares != position.shares:
             raise ValueError("share_mismatch")
 
-        pct_from_entry = ((price - position.entry_price) / position.entry_price * 100) if position.entry_price else 0.0
+        pct_from_entry = self._pct_chg(price, position.entry_price)
         await self._execution.execute_sell(
             symbol=symbol,
             price=price,
@@ -2745,6 +2649,7 @@ class AutoTrader:
             "[PAPER PARTIAL SELL] %s @ %.2f partial=%d remaining=%d net_pnl=%.0f",
             symbol, price, partial_shares, position.shares, net_pnl,
         )
+        await self._send(text)
 
     async def _paper_sell(
         self,
@@ -2880,6 +2785,7 @@ class AutoTrader:
             ]
         )
         logger.info("[PAPER SELL] %s @ %.2f reason=%s net_pnl=%.0f", symbol, price, reason, net_pnl)
+        await self._send(text)
 
         if self._risk.is_halted:
             await self._send(f"[風控警示] 當日損益已達限制：{daily_pnl:+,.0f} 元，系統將暫停新單。")
@@ -2948,6 +2854,13 @@ class AutoTrader:
         return self._session
 
     async def close(self) -> None:
+        if self._monitor_task is not None and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
         if self._session and not self._session.closed:
             await self._session.close()
 

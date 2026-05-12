@@ -218,7 +218,6 @@ class MockCollector:
             try:
                 cached_news = self._news_fetcher._cache
                 if cached_news:
-                    import datetime as _dt
                     payload = self._news_fetcher.to_payload()
                     await websocket.send(json.dumps(payload, separators=(",", ":")))
             except Exception:
@@ -397,8 +396,6 @@ class MockCollector:
         try:
             while self._accepting:
                 await asyncio.sleep(random.uniform(0.2, 1.0))
-                now_tw = datetime.datetime.now(tz=_TZ_TW)
-                t = now_tw.hour * 60 + now_tw.minute
                 in_trading = True  # MOCK: always simulate trading hours
 
                 if in_trading:
