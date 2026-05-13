@@ -246,9 +246,16 @@ def main() -> None:
     for sym in closed_syms:
         del positions[sym]
 
+    # 重算 deployed/cash 確保數字嚴格一致，不累積誤差
+    capital = pos_data.get("capital_total", 1_000_000)
+    recalc_deployed = sum(
+        p["entry_price"] * p["shares"] for p in positions.values()
+    )
+    recalc_cash = capital - recalc_deployed
+
     pos_data["positions"]        = positions
-    pos_data["capital_deployed"] = max(deployed, 0)
-    pos_data["capital_cash"]     = cash
+    pos_data["capital_deployed"] = round(recalc_deployed, 2)
+    pos_data["capital_cash"]     = round(recalc_cash, 2)
 
     with open(POSITIONS_PATH, "w", encoding="utf-8") as f:
         json.dump(pos_data, f, ensure_ascii=False, indent=2)

@@ -279,12 +279,16 @@ def run(
             "final_score": sc,
         }
 
-    # ── Step 9：寫入持倉 ──────────────────────────────────────
+    # ── Step 9：寫入持倉（deployed/cash 從實際持倉反算，防止漂移）──
     if not dry_run and new_positions:
-        pos_data["positions"].update(new_positions)
-        pos_data["capital_deployed"] = running_deployed
-        pos_data["capital_cash"] = capital_total - running_deployed
         import datetime
+        pos_data["positions"].update(new_positions)
+        all_positions = pos_data["positions"]
+        recalc_deployed = sum(
+            p["entry_price"] * p["shares"] for p in all_positions.values()
+        )
+        pos_data["capital_deployed"] = round(recalc_deployed, 2)
+        pos_data["capital_cash"]     = round(capital_total - recalc_deployed, 2)
         pos_data["trade_date"] = datetime.datetime.now().strftime("%Y%m%d")
         _save_positions(POSITIONS_PATH, pos_data)
         print(f"[Supervisor] 已更新持倉 {len(new_positions)} 檔")

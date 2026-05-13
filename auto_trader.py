@@ -2064,11 +2064,20 @@ class AutoTrader:
         if self._book.positions:
             first_position = next(iter(self._book.positions.values()))
             snapshot_trade_date = self._position_trade_date(first_position.entry_ts)
+        # 每次寫入前重算 deployed/cash，杜絕數字漂移
+        capital_total = self._risk.capital_total if hasattr(self._risk, 'capital_total') else 1_000_000
+        deployed_actual = sum(
+            p.entry_price * p.shares for p in self._book.positions.values()
+        )
         payload = {
             "trade_date": snapshot_trade_date,
+            "capital_total": capital_total,
+            "capital_deployed": round(deployed_actual, 2),
+            "capital_cash": round(capital_total - deployed_actual, 2),
             "positions": {
                 symbol: {
                     "symbol": position.symbol,
+                    "name": getattr(position, "name", ""),
                     "side": position.side,
                     "entry_price": position.entry_price,
                     "shares": position.shares,
