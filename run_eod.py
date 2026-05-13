@@ -184,16 +184,10 @@ def main() -> None:
     with open("data/flow_cache.json", encoding="utf-8") as f:
         flow_all = json.load(f)
 
-    pos_report  = build_position_report(pos_data, price_cache, flow_all)
-    flow_report = build_flow_report(flow_all)
+    pos_report = build_position_report(pos_data, price_cache, flow_all)
 
     print(pos_report)
-    print()
-    print(flow_report)
-
     send_telegram(pos_report)
-    time.sleep(1)
-    send_telegram(flow_report)
     print("盤後報告推播完成。")
 
 
