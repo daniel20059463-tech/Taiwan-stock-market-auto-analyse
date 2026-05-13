@@ -9,7 +9,30 @@
 """
 from __future__ import annotations
 import json, os, sys, urllib.request, datetime, time
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_PATH = os.path.join(_LOG_DIR, f"eod_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            try: s.write(data); s.flush()
+            except Exception: pass
+    def flush(self):
+        for s in self._streams:
+            try: s.flush()
+            except Exception: pass
+    def reconfigure(self, **kwargs):
+        pass
+
+_log_file = open(_LOG_PATH, "w", encoding="utf-8", buffering=1)
+sys.stdout = _Tee(sys.__stdout__, _log_file)
+sys.stderr = _Tee(sys.__stderr__, _log_file)
+sys.__stdout__.reconfigure(encoding="utf-8", errors="replace")
+
 from dotenv import load_dotenv
 load_dotenv()
 

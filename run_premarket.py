@@ -15,8 +15,31 @@
   python run_premarket.py --skip-news      # 跳過 news agent（加快速度）
 """
 from __future__ import annotations
-import sys, argparse, time, json, urllib.request
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+import sys, argparse, time, json, urllib.request, os, datetime
+
+# 同時輸出到終端機和 log 檔
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_PATH = os.path.join(_LOG_DIR, f"premarket_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            try: s.write(data); s.flush()
+            except Exception: pass
+    def flush(self):
+        for s in self._streams:
+            try: s.flush()
+            except Exception: pass
+    def reconfigure(self, **kwargs):
+        pass  # no-op: encoding already set on underlying streams
+
+_log_file = open(_LOG_PATH, "w", encoding="utf-8", buffering=1)
+sys.stdout = _Tee(sys.__stdout__, _log_file)
+sys.stderr = _Tee(sys.__stderr__, _log_file)
+sys.__stdout__.reconfigure(encoding="utf-8", errors="replace")
 
 from trading_agents import flow_agent, technical_agent, news_agent, risk_agent, supervisor
 
