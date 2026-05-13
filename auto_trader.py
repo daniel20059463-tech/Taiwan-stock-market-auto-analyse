@@ -86,7 +86,21 @@ MAX_SECTOR_POSITIONS = 5       # 同一類股最多同時持有的部位數
 PREOPEN_WATCHLIST_THRESHOLD = 0.5  # 籌碼確認標的的盤中進場門檻（低於一般動能觸發）
 
 _EXCLUDED_BUY_SECTOR_CODES = {"17"}
-_EXCLUDED_BUY_SECTOR_KEYWORDS = ("金融", "保險", "銀行", "證券", "期貨", "金控")
+_EXCLUDED_BUY_SECTOR_KEYWORDS = (
+    # 金融
+    "金融", "保險", "銀行", "證券", "期貨", "金控", "再保",
+    # 營建
+    "營建", "建設", "建築", "地產",
+    # 旅遊/觀光/航運
+    "旅遊", "觀光", "航運", "航空",
+    # 食品
+    "食品", "飲料", "餐飲",
+    # 傳產
+    "紡織", "橡膠", "化工", "鋼鐵", "汽車", "造紙", "塑膠", "水泥",
+)
+
+# 無法從 sector 欄位判斷時的備用黑名單（代號直接過濾）
+from trading_agents.excluded_sectors import EXCLUDED_SYMBOLS as _EXCLUDED_SYMBOLS
 
 _TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -590,13 +604,20 @@ class AutoTrader:
     def _clear_retail_flow_non_entry_reason(self, symbol: str) -> None:
         self._retail_flow_non_entry_reasons.pop(symbol, None)
 
-    def _is_financial_sector(self, sector: str) -> bool:
+    def _is_excluded_sector(self, symbol: str, sector: str) -> bool:
+        # 先用代號黑名單（最可靠，不依賴 sector 字串）
+        if symbol in _EXCLUDED_SYMBOLS:
+            return True
         normalized = str(sector or "").strip()
         if not normalized:
             return False
         if normalized in _EXCLUDED_BUY_SECTOR_CODES:
             return True
         return any(keyword in normalized for keyword in _EXCLUDED_BUY_SECTOR_KEYWORDS)
+
+    def _is_financial_sector(self, sector: str) -> bool:
+        """Backward-compat shim — use _is_excluded_sector instead."""
+        return self._is_excluded_sector("", sector)
 
     def _build_preopen_watchlist(self) -> None:
         """每日換日時建立今日籌碼確認標的清單，讓這些股票以較低門檻進場。"""
@@ -795,8 +816,8 @@ class AutoTrader:
         payload: dict[str, Any],
     ) -> None:
         sector = self._symbol_sectors.get(symbol) or str(payload.get("sector", "")).strip()
-        if self._is_financial_sector(sector):
-            self._set_retail_flow_non_entry_reason(symbol, "financial_sector")
+        if self._is_excluded_sector(symbol, sector):
+            self._set_retail_flow_non_entry_reason(symbol, "excluded_sector")
             logger.info("Skip retail_flow_swing entry for %s: excluded sector=%s", symbol, sector)
             return
 
