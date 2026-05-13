@@ -403,6 +403,52 @@ class AutoTrader:
         """Calculate a simple ATR from recent 1-minute candles."""
         return self._market.calculate_atr(symbol)
 
+    def _recent_bar_lows(self, symbol: str, n: int) -> list[float]:
+        """從 daily_price_cache 取最近 n 根日K低點。"""
+        if self._daily_price_cache is None:
+            return []
+        bars = self._daily_price_cache.get_bars(symbol, n=n + 5)
+        return [b.low for b in bars[-n:] if b.low > 0]
+
+    def _tiered_trail_stop(
+        self,
+        symbol: str,
+        price: float,
+        entry_price: float,
+        current_trail: float,
+        daily_atr: Optional[float],
+    ) -> float:
+        """三段式追蹤停損：依浮盈比例決定追蹤策略。
+
+        < 3%：維持初始停損不動（避免被震倉）
+        3–8%：日線近 3 根低點 - 0.3 ATR（鎖住小段獲利）
+        > 8%：週線前低（近 5 根低點 - 0.2 ATR）讓獲利奔跑
+        """
+        pnl_pct = (price - entry_price) / entry_price * 100
+
+        if pnl_pct < 3.0:
+            return current_trail  # 浮盈太小，停損不動
+
+        atr_buf = (daily_atr * 0.3) if (daily_atr and daily_atr > 0) else 0.0
+
+        if pnl_pct < 8.0:
+            # 日線近 3 根低點
+            lows3 = self._recent_bar_lows(symbol, n=3)
+            if lows3:
+                candidate = round(min(lows3) - atr_buf, 2)
+                return max(current_trail, candidate)
+        else:
+            # 週線前低（近 5 個交易日）
+            lows5 = self._recent_bar_lows(symbol, n=5)
+            if lows5:
+                candidate = round(min(lows5) - atr_buf * 0.7, 2)
+                return max(current_trail, candidate)
+
+        # 後備：ATR × 2.5
+        if daily_atr and daily_atr > 0:
+            return max(current_trail, round(price - daily_atr * 2.5, 2))
+        return current_trail
+
     def _daily_atr(self, symbol: str, period: int = 14) -> Optional[float]:
         """Return daily ATR from the persisted daily price cache.
 
@@ -918,18 +964,21 @@ class AutoTrader:
         if position is None or position.side != "long":
             return
 
-        # Trailing stop: raise stop as price makes new highs (daily ATR × 3 trail distance)
+        # Trailing stop: 三段式追蹤（依浮盈比例切換策略）
         if price > position.peak_price:
             position.peak_price = price
-            daily_atr = self._daily_atr(symbol)
-            trail_dist = (daily_atr * 3.0) if (daily_atr and daily_atr > 0) else (price * TRAIL_STOP_FALLBACK / 100)
-            new_trail = position.peak_price - trail_dist
-            if new_trail > position.trail_stop_price:
-                position.trail_stop_price = round(new_trail, 2)
-                logger.debug(
-                    "%s swing trail stop raised: peak=%.2f trail=%.2f",
-                    symbol, position.peak_price, position.trail_stop_price,
-                )
+        daily_atr = self._daily_atr(symbol)
+        new_trail = self._tiered_trail_stop(
+            symbol, price, position.entry_price,
+            position.trail_stop_price, daily_atr,
+        )
+        if new_trail > position.trail_stop_price:
+            position.trail_stop_price = round(new_trail, 2)
+            logger.debug(
+                "%s swing trail stop raised: peak=%.2f trail=%.2f pnl_pct=%.1f%%",
+                symbol, position.peak_price, position.trail_stop_price,
+                (price - position.entry_price) / position.entry_price * 100,
+            )
 
         effective_stop = max(position.stop_price, position.trail_stop_price)
 

@@ -22,8 +22,7 @@ TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 NOW   = datetime.datetime.now(tz=TZ_TW)
 NOW_STR = NOW.strftime("%H:%M")
 
-TRAIL_PCT  = 0.035   # 追蹤停損距離 3.5%（以最高價計）
-SHORT_TRAIL_PCT = 0.035
+SHORT_TRAIL_PCT = 0.035  # 空單固定追蹤 3.5%
 
 
 def fetch_price(sym: str) -> float | None:
@@ -92,16 +91,28 @@ def main() -> None:
         close_reason = ""
 
         if side == "long":
-            # 更新追蹤停損
             if price > peak:
                 pos["peak_price"] = price
-                new_trail = round(price * (1 - TRAIL_PCT), 2)
-                if new_trail > trail:
-                    pos["trail_stop_price"] = new_trail
-                    trail = new_trail
+                peak = price
+
+            pnl_pct = (price - entry) / entry * 100
+
+            # 三段式追蹤停損
+            new_trail = trail
+            if pnl_pct >= 3.0:
+                with open("data/daily_price_cache.json", encoding="utf-8") as _f:
+                    _pc = json.load(_f)
+                _bars = sorted(_pc.get(sym, {}).items())
+                _lows = [v["low"] for _, v in _bars if v.get("low", 0) > 0]
+                if pnl_pct < 8.0 and len(_lows) >= 3:
+                    new_trail = max(trail, round(min(_lows[-3:]), 2))
+                elif len(_lows) >= 5:
+                    new_trail = max(trail, round(min(_lows[-5:]), 2))
+            if new_trail > trail:
+                pos["trail_stop_price"] = new_trail
+                trail = new_trail
 
             pnl = (price - entry) * shares
-            pnl_pct = (price - entry) / entry * 100
 
             if price <= trail:
                 close_reason = f"追蹤停損觸發 {price:.2f} <= {trail:.2f}"
