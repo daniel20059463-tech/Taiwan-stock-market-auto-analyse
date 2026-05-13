@@ -97,20 +97,30 @@ def build_position_report(pos_data: dict, price_cache: dict, flow_all: dict) -> 
         name   = pos.get("name", sym)
         reason = pos.get("entry_reason", "")
 
-        # 最新收盤（price_cache 優先，否則 Yahoo）
+        # 最新收盤：cache 有今日資料才用，否則一律抓 Yahoo 確保價格正確
         sym_bars = price_cache.get(sym, {})
-        if sym_bars:
+        cache_latest = sorted(sym_bars.keys())[-1] if sym_bars else ""
+        if sym_bars and cache_latest >= TODAY:
             recent = sorted(sym_bars.keys())[-20:]
             closes = [sym_bars[d]["close"] for d in recent if sym_bars[d].get("close")]
             current = closes[-1] if closes else entry
             ma10    = sum(closes[-10:]) / len(closes[-10:]) if len(closes) >= 10 else None
             highs   = [sym_bars[d].get("high", 0) for d in recent]
-            lows    = [sym_bars[d].get("low", 999999) for d in recent]
             resist  = max(highs) if highs else target
             support = ma10 or stop
         else:
+            # cache 沒有今日資料，直接抓 Yahoo 即時收盤
             current = fetch_close(sym) or entry
-            ma10, resist, support = None, target, stop
+            if sym_bars:
+                recent = sorted(sym_bars.keys())[-20:]
+                closes = [sym_bars[d]["close"] for d in recent if sym_bars[d].get("close")]
+                closes.append(current)  # 補上今日
+                ma10   = sum(closes[-10:]) / len(closes[-10:]) if len(closes) >= 10 else None
+                highs  = [sym_bars[d].get("high", 0) for d in recent]
+                resist = max(highs) if highs else target
+                support = ma10 or stop
+            else:
+                ma10, resist, support = None, target, stop
 
         if side == "long":
             pnl     = (current - entry) * shares
