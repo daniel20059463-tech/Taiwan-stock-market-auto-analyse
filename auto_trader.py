@@ -1259,6 +1259,7 @@ class AutoTrader:
             entry_atr=atr,
             peak_price=execution_price,
             trail_stop_price=stop_price,
+            initial_stop_price=stop_price,
         )
         self._book.positions[symbol] = position
         sector = self._symbol_sectors.get(symbol, "")
@@ -1335,13 +1336,37 @@ class AutoTrader:
                     position.trail_stop_price,
                 )
 
-        # 分批出場：達到 1:1 盈虧比時先出 50%（限 2 張以上持倉），停損移至成本
-        if not position.partial_exit_done and position.shares >= 2 * SHARES_PER_LOT:
-            risk = position.entry_price - position.stop_price
-            if risk > 0 and price >= position.entry_price + risk:
-                partial_shares = position.shares // 2
-                await self._paper_partial_sell(symbol, price, ts_ms, partial_shares)
-                return  # 下一 tick 再繼續追蹤剩餘部位
+        # 三批分批出場（多單）
+        init_risk = (position.entry_price - position.initial_stop_price
+                     if position.initial_stop_price > 0
+                     else position.entry_price - position.stop_price)
+
+        if position.partial_exit_batch == 0 and position.shares >= 3 * SHARES_PER_LOT and init_risk > 0:
+            # Batch 1: +1R → 出 50%，停損移至進場成本
+            if price >= position.entry_price + init_risk:
+                sell = max(SHARES_PER_LOT,
+                           (position.shares // 2) // SHARES_PER_LOT * SHARES_PER_LOT)
+                await self._paper_partial_sell(symbol, price, ts_ms, sell,
+                                               batch=1, new_stop=position.entry_price)
+                return
+
+        elif position.partial_exit_batch == 1 and position.shares >= 2 * SHARES_PER_LOT and init_risk > 0:
+            # Batch 2: +2R 或近 20 日高點 → 出 3/5 剩餘，停損移至 +1R
+            at_2r = price >= position.entry_price + 2 * init_risk
+            at_resistance = False
+            pc = self._daily_price_cache
+            if pc is not None and not at_2r:
+                bars = pc.get_bars(symbol, n=25)
+                highs = [b.high for b in bars[-20:] if b.high > 0]
+                if highs and price >= max(highs):
+                    at_resistance = True
+            if at_2r or at_resistance:
+                sell = max(SHARES_PER_LOT,
+                           (position.shares * 3 // 5) // SHARES_PER_LOT * SHARES_PER_LOT)
+                new_stop = round(position.entry_price + init_risk, 2)
+                await self._paper_partial_sell(symbol, price, ts_ms, sell,
+                                               batch=2, new_stop=new_stop)
+                return
 
         effective_stop = max(position.stop_price, position.trail_stop_price)
         reason: Optional[str] = None
@@ -1668,6 +1693,7 @@ class AutoTrader:
             entry_atr=atr,
             peak_price=execution_price,
             trail_stop_price=stop_price,
+            initial_stop_price=stop_price,
         )
         self._book.positions[symbol] = position
         await self._persist_position_open(symbol)
@@ -1942,6 +1968,8 @@ class AutoTrader:
                         entry_atr=row.get("entry_atr"),
                         peak_price=row.get("peak_price", row["entry_price"]),
                         trail_stop_price=row.get("trail_stop_price", row["stop_price"]),
+                        partial_exit_batch=int(row.get("partial_exit_batch", 0)),
+                        initial_stop_price=float(row.get("initial_stop_price", row["stop_price"])),
                     )
                     self._book.positions[row["symbol"]] = position
                     
@@ -2051,6 +2079,8 @@ class AutoTrader:
                     "peak_price": position.peak_price,
                     "trail_stop_price": position.trail_stop_price,
                     "entry_atr": position.entry_atr,
+                    "partial_exit_batch": position.partial_exit_batch,
+                    "initial_stop_price": position.initial_stop_price,
                 }
                 for symbol, position in self._book.positions.items()
             },
@@ -2084,7 +2114,9 @@ class AutoTrader:
                     entry_atr=(float(row["entry_atr"]) if row.get("entry_atr") is not None else None),
                     peak_price=float(row.get("peak_price", row["entry_price"])),
                     trail_stop_price=float(row.get("trail_stop_price", row["stop_price"])),
-                    partial_exit_done=bool(row.get("partial_exit_done", False)),
+                    partial_exit_batch=int(row.get("partial_exit_batch",
+                                           1 if row.get("partial_exit_done") else 0)),
+                    initial_stop_price=float(row.get("initial_stop_price", row["stop_price"])),
                 )
                 self._book.positions[position.symbol] = position
                 restored += 1
@@ -2672,19 +2704,21 @@ class AutoTrader:
         price: float,
         ts_ms: int,
         partial_shares: int,
+        batch: int = 1,
+        new_stop: float | None = None,
     ) -> None:
-        """出場 50% 部位：鎖定 1:1 利潤，停損移至進場成本價，剩餘繼續追蹤。"""
+        """分批停利出場，依 batch 標記進度並更新停損。"""
         position = self._book.positions[symbol]
         slippage_bps = self._resolve_slippage_bps(symbol, price=price, shares=position.shares)
         execution_price = round(price * (1 - slippage_bps / 10000), 2)
         gross_pnl = (execution_price - position.entry_price) * partial_shares
         net_pnl = self._risk.calc_net_pnl(position.entry_price, execution_price, partial_shares)
 
-        # 更新持倉：減少張數、停損移至成本、標記已做過分批
         position.shares -= partial_shares
-        position.stop_price = position.entry_price
-        position.trail_stop_price = max(position.trail_stop_price, position.entry_price)
-        position.partial_exit_done = True
+        if new_stop is not None:
+            position.stop_price = new_stop
+            position.trail_stop_price = max(position.trail_stop_price, new_stop)
+        position.partial_exit_batch = batch
         await self._persist_position_open(symbol)
 
         record = TradeRecord(
@@ -2692,7 +2726,7 @@ class AutoTrader:
             action="SELL",
             price=execution_price,
             shares=partial_shares,
-            reason="PARTIAL_PROFIT",
+            reason=f"PARTIAL_PROFIT_B{batch}",
             pnl=net_pnl,
             ts=ts_ms,
             gross_pnl=gross_pnl,
@@ -2701,23 +2735,25 @@ class AutoTrader:
         self._risk.on_sell(symbol, net_pnl)
         await self._persist_trade(record)
 
+        batch_label = {1: "第一批 50%", 2: "第二批 30%", 3: "最終批"}.get(batch, f"第{batch}批")
         tx_cost = gross_pnl - net_pnl
+        stop_note = f"{new_stop:,.2f}" if new_stop is not None else "不變"
         text = "\n".join(
             [
-                "[模擬交易] 分批停利（50%）",
+                f"[模擬交易] 分批停利（{batch_label}）",
                 f"標的：{symbol}",
                 f"出場價：{price:,.2f} (滑價後: {execution_price:,.2f})",
                 f"張數：{partial_shares // SHARES_PER_LOT} 張（{partial_shares:,} 股）",
                 f"毛損益：{gross_pnl:+,.0f} 元",
                 f"交易成本：{tx_cost:,.0f} 元",
                 f"淨損益：{net_pnl:+,.0f} 元",
-                f"剩餘持倉：{position.shares:,} 股，停損已移至成本 {position.entry_price:,.2f}",
+                f"剩餘持倉：{position.shares:,} 股，停損移至 {stop_note}",
                 f"時間：{_ms_to_time(ts_ms)}",
             ]
         )
         logger.info(
-            "[PAPER PARTIAL SELL] %s @ %.2f partial=%d remaining=%d net_pnl=%.0f",
-            symbol, price, partial_shares, position.shares, net_pnl,
+            "[PAPER PARTIAL SELL] %s batch=%d @ %.2f partial=%d remaining=%d net_pnl=%.0f",
+            symbol, batch, price, partial_shares, position.shares, net_pnl,
         )
         await self._send(text)
 

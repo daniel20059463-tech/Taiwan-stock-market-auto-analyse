@@ -17,7 +17,8 @@ class PaperPosition:
     entry_atr: float | None = None
     peak_price: float = 0.0
     trail_stop_price: float = 0.0
-    partial_exit_done: bool = False
+    partial_exit_batch: int = 0       # 0=未出場, 1=已出第一批(50%), 2=已出第二批(30%)
+    initial_stop_price: float = 0.0  # 進場時原始停損，永不更改
 
 
 @dataclass

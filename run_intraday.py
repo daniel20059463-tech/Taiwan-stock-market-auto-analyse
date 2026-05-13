@@ -79,16 +79,20 @@ def main() -> None:
             print(f"  {sym}: 無法取得價格")
             continue
 
-        side   = pos.get("side", "long")
-        entry  = pos["entry_price"]
-        shares = pos["shares"]
-        stop   = pos["stop_price"]
-        target = pos["target_price"]
-        trail  = pos.get("trail_stop_price", stop)
-        peak   = pos.get("peak_price", entry)
-        name   = pos.get("name", sym)
+        side         = pos.get("side", "long")
+        entry        = pos["entry_price"]
+        shares       = pos["shares"]
+        stop         = pos["stop_price"]
+        target       = pos["target_price"]
+        trail        = pos.get("trail_stop_price", stop)
+        peak         = pos.get("peak_price", entry)
+        name         = pos.get("name", sym)
+        batch        = pos.get("partial_exit_batch", 0)
+        init_stop    = pos.get("initial_stop_price", stop)
+        SHARES_PER_LOT = 1000
 
-        close_reason = ""
+        close_reason   = ""
+        partial_reason = ""
 
         if side == "long":
             if price > peak:
@@ -112,10 +116,64 @@ def main() -> None:
                 pos["trail_stop_price"] = new_trail
                 trail = new_trail
 
-            pnl = (price - entry) * shares
+            # 三批分出場
+            init_risk = entry - init_stop if init_stop > 0 else 0
+            if init_risk > 0:
+                if batch == 0 and shares >= 3 * SHARES_PER_LOT:
+                    if price >= entry + init_risk:
+                        sell = max(SHARES_PER_LOT,
+                                   (shares // 2) // SHARES_PER_LOT * SHARES_PER_LOT)
+                        pnl_sell = (price - entry) * sell
+                        pos["shares"] -= sell
+                        pos["stop_price"] = entry
+                        pos["trail_stop_price"] = max(trail, entry)
+                        pos["partial_exit_batch"] = 1
+                        cash += price * sell
+                        deployed -= entry * sell
+                        partial_reason = (
+                            f"分批停利第一批（50%） {sym} {name}\n"
+                            f"  出場 {sell // SHARES_PER_LOT} 張 @ {price:.2f}\n"
+                            f"  損益 {pnl_sell:+,.0f} 元  停損移至成本 {entry:.2f}\n"
+                            f"  剩餘 {pos['shares'] // SHARES_PER_LOT} 張"
+                        )
 
-            if price <= trail:
-                close_reason = f"追蹤停損觸發 {price:.2f} <= {trail:.2f}"
+                elif batch == 1 and shares >= 2 * SHARES_PER_LOT:
+                    at_2r = price >= entry + 2 * init_risk
+                    at_res = False
+                    if not at_2r:
+                        try:
+                            with open("data/daily_price_cache.json", encoding="utf-8") as _f:
+                                _pc = json.load(_f)
+                            _bars = sorted(_pc.get(sym, {}).items())
+                            _highs = [v["high"] for _, v in _bars[-20:] if v.get("high", 0) > 0]
+                            at_res = bool(_highs) and price >= max(_highs)
+                        except Exception:
+                            pass
+                    if at_2r or at_res:
+                        sell = max(SHARES_PER_LOT,
+                                   (shares * 3 // 5) // SHARES_PER_LOT * SHARES_PER_LOT)
+                        pnl_sell = (price - entry) * sell
+                        new_stop = round(entry + init_risk, 2)
+                        pos["shares"] -= sell
+                        pos["stop_price"] = new_stop
+                        pos["trail_stop_price"] = max(trail, new_stop)
+                        pos["partial_exit_batch"] = 2
+                        cash += price * sell
+                        deployed -= entry * sell
+                        reason_tag = "達+2R" if at_2r else "碰20日高點"
+                        partial_reason = (
+                            f"分批停利第二批（30%）{reason_tag} {sym} {name}\n"
+                            f"  出場 {sell // SHARES_PER_LOT} 張 @ {price:.2f}\n"
+                            f"  損益 {pnl_sell:+,.0f} 元  停損移至+1R {new_stop:.2f}\n"
+                            f"  剩餘 {pos['shares'] // SHARES_PER_LOT} 張"
+                        )
+
+            pnl = (price - entry) * pos["shares"]
+            shares = pos["shares"]  # 更新為分批後的數量
+
+            if price <= max(pos["stop_price"], pos.get("trail_stop_price", trail)):
+                effective_stop = max(pos["stop_price"], pos.get("trail_stop_price", trail))
+                close_reason = f"追蹤停損觸發 {price:.2f} <= {effective_stop:.2f}"
             elif price >= target:
                 close_reason = f"達到目標價 {price:.2f} >= {target:.2f}"
 
@@ -135,13 +193,19 @@ def main() -> None:
             elif price <= target:
                 close_reason = f"達到目標價 {price:.2f} <= {target:.2f}"
 
+        if partial_reason:
+            alerts.append(partial_reason)
+
         if close_reason:
-            # 平倉
-            lot_val = price * shares
+            # 平倉（使用分批後的剩餘 shares）
             if side == "long":
+                pnl     = (price - entry) * shares
+                pnl_pct = (price - entry) / entry * 100
                 deployed -= entry * shares
-                cash += lot_val
+                cash += price * shares
             else:
+                pnl     = (entry - price) * shares
+                pnl_pct = (entry - price) / entry * 100
                 deployed -= entry * shares
                 cash += (entry - price) * shares + entry * shares
 
@@ -151,9 +215,9 @@ def main() -> None:
                 f"  損益 {pnl:+,.0f} 元（{pnl_pct:+.2f}%）"
             )
             closed_syms.append(sym)
-        else:
-            print(f"  {sym} {name}: {price:.2f}  浮盈 {pnl:+,.0f}({pnl_pct:+.2f}%)  "
-                  f"Trail={trail:.2f}")
+        elif not partial_reason:
+            print(f"  {sym} {name}: {price:.2f}  浮盈 {pnl:+,.0f}  "
+                  f"Trail={pos.get('trail_stop_price', trail):.2f}")
 
     # 移除平倉部位
     for sym in closed_syms:
