@@ -41,6 +41,19 @@ sys.stdout = _Tee(sys.__stdout__, _log_file)
 sys.stderr = _Tee(sys.__stderr__, _log_file)
 sys.__stdout__.reconfigure(encoding="utf-8", errors="replace")
 
+# 非交易日直接結束
+try:
+    from market_calendar import is_known_open_trading_date
+    _tz_tw = datetime.timezone(datetime.timedelta(hours=8))
+    _today = datetime.datetime.now(tz=_tz_tw)
+    if not is_known_open_trading_date(_today):
+        print(f"今日（{_today.strftime('%Y-%m-%d')}）非台股交易日，跳過盤前掃描。")
+        sys.exit(0)
+except SystemExit:
+    raise
+except Exception:
+    pass
+
 from trading_agents import flow_agent, technical_agent, news_agent, risk_agent, supervisor
 
 

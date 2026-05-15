@@ -41,6 +41,15 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 TODAY = datetime.datetime.now(tz=TZ_TW).strftime("%Y-%m-%d")
 
+# 非交易日直接結束
+try:
+    from market_calendar import is_known_open_trading_date
+    if not is_known_open_trading_date(datetime.datetime.now(tz=TZ_TW)):
+        print(f"今日（{TODAY}）非台股交易日，跳過盤後報告。")
+        sys.exit(0)
+except Exception:
+    pass
+
 
 def fetch_close(sym: str) -> float | None:
     for suffix in (".TW", ".TWO"):

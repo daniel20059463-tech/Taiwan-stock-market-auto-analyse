@@ -43,9 +43,39 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 POSITIONS_PATH = "data/paper_positions.json"
 TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 NOW   = datetime.datetime.now(tz=TZ_TW)
+
+# 非交易日直接結束
+try:
+    from market_calendar import is_known_open_trading_date
+    if not is_known_open_trading_date(NOW):
+        print(f"[{NOW.strftime('%H:%M')}] 今日非台股交易日，跳過盤中監控。")
+        sys.exit(0)
+except Exception:
+    pass
 NOW_STR = NOW.strftime("%H:%M")
 
 SHORT_TRAIL_PCT = 0.035  # 空單固定追蹤 3.5%
+
+# 台股交易成本
+COMMISSION_RATE = 0.001425   # 買賣手續費各 0.1425%
+SECURITIES_TAX  = 0.003      # 證交稅 0.3%（賣出）
+COMMISSION_MIN  = 20         # 最低手續費 20 元
+
+
+def calc_net_pnl(entry: float, sell_price: float, shares: int) -> float:
+    """計算含手續費與證交稅的淨損益。"""
+    gross   = (sell_price - entry) * shares
+    buy_fee = max(COMMISSION_MIN, entry * shares * COMMISSION_RATE)
+    sell_fee = max(COMMISSION_MIN, sell_price * shares * (COMMISSION_RATE + SECURITIES_TAX))
+    return round(gross - buy_fee - sell_fee, 0)
+
+
+def calc_net_pnl_short(entry: float, cover_price: float, shares: int) -> float:
+    """空單淨損益（放空成本含手續費，回補含手續費+證交稅）。"""
+    gross   = (entry - cover_price) * shares
+    sell_fee = max(COMMISSION_MIN, entry * shares * (COMMISSION_RATE + SECURITIES_TAX))
+    buy_fee  = max(COMMISSION_MIN, cover_price * shares * COMMISSION_RATE)
+    return round(gross - sell_fee - buy_fee, 0)
 
 
 def fetch_price(sym: str) -> float | None:
@@ -146,17 +176,18 @@ def main() -> None:
                     if price >= entry + init_risk:
                         sell = max(SHARES_PER_LOT,
                                    (shares // 2) // SHARES_PER_LOT * SHARES_PER_LOT)
-                        pnl_sell = (price - entry) * sell
+                        pnl_sell = calc_net_pnl(entry, price, sell)
+                        sell_proceeds = price * sell - max(COMMISSION_MIN, price * sell * (COMMISSION_RATE + SECURITIES_TAX))
                         pos["shares"] -= sell
                         pos["stop_price"] = entry
                         pos["trail_stop_price"] = max(trail, entry)
                         pos["partial_exit_batch"] = 1
-                        cash += price * sell
+                        cash += sell_proceeds
                         deployed -= entry * sell
                         partial_reason = (
                             f"分批停利第一批（50%） {sym} {name}\n"
                             f"  出場 {sell // SHARES_PER_LOT} 張 @ {price:.2f}\n"
-                            f"  損益 {pnl_sell:+,.0f} 元  停損移至成本 {entry:.2f}\n"
+                            f"  淨損益 {pnl_sell:+,.0f} 元（含手續費）  停損移至成本 {entry:.2f}\n"
                             f"  剩餘 {pos['shares'] // SHARES_PER_LOT} 張"
                         )
 
@@ -175,24 +206,25 @@ def main() -> None:
                     if at_2r or at_res:
                         sell = max(SHARES_PER_LOT,
                                    (shares * 3 // 5) // SHARES_PER_LOT * SHARES_PER_LOT)
-                        pnl_sell = (price - entry) * sell
+                        pnl_sell = calc_net_pnl(entry, price, sell)
+                        sell_proceeds = price * sell - max(COMMISSION_MIN, price * sell * (COMMISSION_RATE + SECURITIES_TAX))
                         new_stop = round(entry + init_risk, 2)
                         pos["shares"] -= sell
                         pos["stop_price"] = new_stop
                         pos["trail_stop_price"] = max(trail, new_stop)
                         pos["partial_exit_batch"] = 2
-                        cash += price * sell
+                        cash += sell_proceeds
                         deployed -= entry * sell
                         reason_tag = "達+2R" if at_2r else "碰20日高點"
                         partial_reason = (
                             f"分批停利第二批（30%）{reason_tag} {sym} {name}\n"
                             f"  出場 {sell // SHARES_PER_LOT} 張 @ {price:.2f}\n"
-                            f"  損益 {pnl_sell:+,.0f} 元  停損移至+1R {new_stop:.2f}\n"
+                            f"  淨損益 {pnl_sell:+,.0f} 元（含手續費）  停損移至+1R {new_stop:.2f}\n"
                             f"  剩餘 {pos['shares'] // SHARES_PER_LOT} 張"
                         )
 
-            pnl = (price - entry) * pos["shares"]
             shares = pos["shares"]  # 更新為分批後的數量
+            pnl = (price - entry) * shares  # 浮盈（未含賣出費用）
 
             if price <= max(pos["stop_price"], pos.get("trail_stop_price", trail)):
                 effective_stop = max(pos["stop_price"], pos.get("trail_stop_price", trail))
@@ -220,26 +252,29 @@ def main() -> None:
             alerts.append(partial_reason)
 
         if close_reason:
-            # 平倉（使用分批後的剩餘 shares）
+            # 平倉（使用分批後的剩餘 shares，損益含手續費與證交稅）
             if side == "long":
-                pnl     = (price - entry) * shares
+                pnl     = calc_net_pnl(entry, price, shares)
                 pnl_pct = (price - entry) / entry * 100
+                sell_proceeds = price * shares - max(COMMISSION_MIN, price * shares * (COMMISSION_RATE + SECURITIES_TAX))
                 deployed -= entry * shares
-                cash += price * shares
+                cash += sell_proceeds
             else:
-                pnl     = (entry - price) * shares
+                pnl     = calc_net_pnl_short(entry, price, shares)
                 pnl_pct = (entry - price) / entry * 100
+                cover_proceeds = entry * shares - max(COMMISSION_MIN, price * shares * COMMISSION_RATE)
                 deployed -= entry * shares
-                cash += (entry - price) * shares + entry * shares
+                cash += cover_proceeds
 
             alerts.append(
                 f"出場 {sym} {name} [{side}]\n"
                 f"  {close_reason}\n"
-                f"  損益 {pnl:+,.0f} 元（{pnl_pct:+.2f}%）"
+                f"  淨損益 {pnl:+,.0f} 元（{pnl_pct:+.2f}%，含手續費）"
             )
             closed_syms.append(sym)
         elif not partial_reason:
-            print(f"  {sym} {name}: {price:.2f}  浮盈 {pnl:+,.0f}  "
+            net_est = calc_net_pnl(entry, price, shares) if side == "long" else calc_net_pnl_short(entry, price, shares)
+            print(f"  {sym} {name}: {price:.2f}  浮盈 {pnl:+,.0f}（淨估 {net_est:+,.0f}）  "
                   f"Trail={pos.get('trail_stop_price', trail):.2f}")
 
     # 移除平倉部位

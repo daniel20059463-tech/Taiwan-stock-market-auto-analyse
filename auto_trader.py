@@ -2104,8 +2104,7 @@ class AutoTrader:
         try:
             with open(path, "r", encoding="utf-8") as file:
                 payload = json.load(file)
-            if str(payload.get("trade_date", "")).strip() != trade_date:
-                return 0
+            # 波段策略持倉需跨日保留，不檢查日期
             rows = payload.get("positions", {})
             restored = 0
             for row in rows.values():
