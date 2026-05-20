@@ -43,6 +43,7 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 POSITIONS_PATH = "data/paper_positions.json"
 TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
 NOW   = datetime.datetime.now(tz=TZ_TW)
+NOW_FULL = NOW.strftime("%Y-%m-%d %H:%M:%S")
 
 # 非交易日直接結束
 try:
@@ -128,6 +129,7 @@ def main() -> None:
 
     for sym, pos in list(positions.items()):
         price = fetch_price(sym)
+        price_time = datetime.datetime.now(tz=TZ_TW).strftime("%H:%M:%S")
         if price is None:
             print(f"  {sym}: 無法取得價格")
             continue
@@ -186,6 +188,7 @@ def main() -> None:
                         deployed -= entry * sell
                         partial_reason = (
                             f"分批停利第一批（50%） {sym} {name}\n"
+                            f"  下單時間：{NOW_FULL}（報價時間 {price_time}）\n"
                             f"  出場 {sell // SHARES_PER_LOT} 張 @ {price:.2f}\n"
                             f"  淨損益 {pnl_sell:+,.0f} 元（含手續費）  停損移至成本 {entry:.2f}\n"
                             f"  剩餘 {pos['shares'] // SHARES_PER_LOT} 張"
@@ -218,6 +221,7 @@ def main() -> None:
                         reason_tag = "達+2R" if at_2r else "碰20日高點"
                         partial_reason = (
                             f"分批停利第二批（30%）{reason_tag} {sym} {name}\n"
+                            f"  下單時間：{NOW_FULL}（報價時間 {price_time}）\n"
                             f"  出場 {sell // SHARES_PER_LOT} 張 @ {price:.2f}\n"
                             f"  淨損益 {pnl_sell:+,.0f} 元（含手續費）  停損移至+1R {new_stop:.2f}\n"
                             f"  剩餘 {pos['shares'] // SHARES_PER_LOT} 張"
@@ -268,6 +272,7 @@ def main() -> None:
 
             alerts.append(
                 f"出場 {sym} {name} [{side}]\n"
+                f"  下單時間：{NOW_FULL}（報價時間 {price_time}）\n"
                 f"  {close_reason}\n"
                 f"  淨損益 {pnl:+,.0f} 元（{pnl_pct:+.2f}%，含手續費）"
             )

@@ -143,9 +143,16 @@ def build_position_report(pos_data: dict, price_cache: dict, flow_all: dict) -> 
         trust   = flow_row.get("investment_trust_net_buy", 0) or 0
         foreign = flow_row.get("foreign_net_buy", 0) or 0
 
+        entry_ts = pos.get("entry_ts", 0)
+        entry_time = (
+            datetime.datetime.fromtimestamp(entry_ts / 1000, tz=TZ_TW).strftime("%Y-%m-%d %H:%M:%S")
+            if entry_ts else "—"
+        )
+
         dir_tag = "多" if side == "long" else "空"
         lines += [
             f"【{sym} {name}】{dir_tag}單",
+            f"  買入時間 : {entry_time}",
             f"  買入價格 : {entry:.2f} 元　{lots} 張",
             f"  進場原因 : {reason}",
             f"  目前價格 : {current:.2f} 元  浮盈 {pnl:+,.0f} 元（{pnl_pct:+.2f}%）",
