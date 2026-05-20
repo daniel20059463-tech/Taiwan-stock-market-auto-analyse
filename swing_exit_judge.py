@@ -17,6 +17,7 @@ FLOW_EXIT_MIN_DAYS = 3
 FLOW_WEAK_STREAK_DAYS = 2
 MA10_BUFFER_PCT = 0.5
 MA10_ATR_BUFFER_MULT = 0.3
+MA10_BUFFER_MAX_PCT = 5.0  # ATR 放大後的緩衝上限，防止極端波動導致過寬鬆
 
 
 @dataclass
@@ -59,7 +60,10 @@ class SwingExitJudge:
 
         ma10_buffer_pct = MA10_BUFFER_PCT
         if atr_pct is not None and atr_pct > 0:
-            ma10_buffer_pct = max(MA10_BUFFER_PCT, atr_pct * MA10_ATR_BUFFER_MULT)
+            ma10_buffer_pct = min(
+                MA10_BUFFER_MAX_PCT,
+                max(MA10_BUFFER_PCT, atr_pct * MA10_ATR_BUFFER_MULT),
+            )
 
         if (
             not above_ma10

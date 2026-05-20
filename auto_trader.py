@@ -290,6 +290,12 @@ class AutoTrader:
 
     def update_market_index(self, change_pct: float) -> None:
         """Update the TAIEX day-change filter used to block new buys."""
+        if not (-20.0 <= change_pct <= 20.0):
+            logger.warning(
+                "update_market_index: 收到異常指數漲跌幅 %.2f%%，已忽略（合理範圍 ±20%%）",
+                change_pct,
+            )
+            return
         self._market_change_pct = change_pct
 
     def set_symbol_sector(self, symbol: str, sector: str) -> None:
@@ -558,7 +564,9 @@ class AutoTrader:
     def _passes_liquidity_filter(self, symbol: str) -> bool:
         avg_daily_value = self._average_daily_value_20d(symbol)
         if avg_daily_value is None:
-            return True
+            # 無歷史資料時拒絕進場，保守策略優先
+            logger.debug("_passes_liquidity_filter: %s 無流動性資料，拒絕進場", symbol)
+            return False
         return avg_daily_value >= MIN_AVG_DAILY_VALUE_20D
 
     def _sector_position_count(self, sector: str) -> int:
@@ -830,10 +838,11 @@ class AutoTrader:
         if updated:
             self._daily_price_cache.prune()
             if self._daily_price_cache_path:
-                try:
-                    self._daily_price_cache.save(self._daily_price_cache_path)
-                except Exception as exc:
-                    logger.warning("Failed to save daily price cache: %s", exc)
+                _save_with_retry(
+                    self._daily_price_cache,
+                    self._daily_price_cache_path,
+                    retries=3,
+                )
             logger.info("Recorded daily closes for %d symbols on %s", updated, trade_date)
 
     async def _handle_retail_flow_tick(
@@ -2992,6 +3001,20 @@ for _legacy_method_name in (
         delattr(AutoTrader, _legacy_method_name)
 
 # Time helpers
+
+def _save_with_retry(cache: Any, path: str, *, retries: int = 3) -> None:
+    """嘗試儲存快取至檔案，失敗時最多重試 retries 次。"""
+    import time
+    for attempt in range(1, retries + 1):
+        try:
+            cache.save(path)
+            return
+        except Exception as exc:
+            logger.warning("save_with_retry: 第 %d/%d 次儲存失敗 (%s): %s", attempt, retries, path, exc)
+            if attempt < retries:
+                time.sleep(0.5 * attempt)
+    logger.error("save_with_retry: 儲存失敗超過 %d 次，快取未寫入磁碟：%s", retries, path)
+
 
 def _ts_to_datetime(ts_ms: int) -> datetime.datetime:
     return datetime.datetime.fromtimestamp(ts_ms / 1000, tz=_TZ_TW)

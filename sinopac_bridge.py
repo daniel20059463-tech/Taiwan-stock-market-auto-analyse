@@ -201,6 +201,7 @@ class SinopacCollector:
         self._last_auth_probe_monotonic: float = 0.0
         self._consecutive_probe_errors: int = 0
         self._consecutive_reconnect_failures: int = 0
+        self._restart_timestamps: list[float] = []  # 記錄每次重啟時間，防止無限迴圈
         self._history_preload_processes: list[multiprocessing.Process] = []
         self._history_preload_inflight: set[str] = set()
         self._reconnecting: bool = False
@@ -431,14 +432,32 @@ class SinopacCollector:
     def _restart_process(self) -> None:
         """重啟整個 process，清除 pysolace 壞掉的底層 transport 狀態。
         使用 os._exit() 確保從任何執行緒呼叫都能立即終止 process。
+
+        防護：若 10 分鐘內已重啟 5 次，判定為持續性故障，不再重啟（halt）。
         """
         import os
         import subprocess
         import sys
         import time
+
+        now = time.monotonic()
+        # 清除 10 分鐘前的重啟紀錄
+        self._restart_timestamps = [t for t in self._restart_timestamps if now - t < 600]
+        _MAX_RESTARTS_PER_10MIN = 5
+        if len(self._restart_timestamps) >= _MAX_RESTARTS_PER_10MIN:
+            logger.critical(
+                "10 分鐘內已重啟 %d 次，判定為持續性故障，停止自動重啟（halt）",
+                len(self._restart_timestamps),
+            )
+            time.sleep(0.5)
+            os._exit(2)  # exit code 2 = halt，supervisor 可據此決定不重啟
+
+        self._restart_timestamps.append(now)
+
         logger.critical(
-            "Restarting process after %d consecutive reconnect failures",
+            "Restarting process after %d consecutive reconnect failures (restart #%d in 10min)",
             self._consecutive_reconnect_failures,
+            len(self._restart_timestamps),
         )
         spawned = False
         try:
@@ -1254,8 +1273,14 @@ class SinopacCollector:
                 portfolio_dirty = False
                 for payload in batch:
                     try:
-                        await self._auto_trader.on_tick(payload)
+                        await asyncio.wait_for(
+                            self._auto_trader.on_tick(payload),
+                            timeout=2.0,  # 單一 tick 處理上限 2 秒，避免卡死廣播迴圈
+                        )
                         portfolio_dirty = True
+                    except asyncio.TimeoutError:
+                        symbol = payload.get("symbol", "?")
+                        logger.warning("AutoTrader.on_tick timeout (>2s) for symbol %s，跳過此 tick", symbol)
                     except Exception as exc:
                         logger.warning("AutoTrader.on_tick error: %s", exc)
 

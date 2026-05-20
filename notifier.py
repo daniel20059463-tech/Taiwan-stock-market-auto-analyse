@@ -136,6 +136,7 @@ class NotifierService:
         self._chat_buckets: dict[int, TokenBucket] = {}
 
         self.degraded_until: float = 0.0
+        self._consecutive_rate_limits: int = 0  # 連續限流次數，用於指數退避
         self.sent_records: list[DeliveryRecord] = []
         self.inbound_processing_delay_seconds: float = 0.0
 
@@ -404,9 +405,13 @@ class NotifierService:
             try:
                 self.telegram_sender(chat_id=chat_id, text=text, parse_mode="Markdown")
             except TelegramRateLimitError as exc:
-                self.degraded_until = max(self.degraded_until, self.clock() + exc.retry_after)
+                self._consecutive_rate_limits += 1
+                # 指數退避：retry_after × 2^(連續次數-1)，上限 300 秒
+                backoff = min(300.0, exc.retry_after * (2 ** (self._consecutive_rate_limits - 1)))
+                self.degraded_until = max(self.degraded_until, self.clock() + backoff)
                 return None
 
+            self._consecutive_rate_limits = 0  # 成功送出，重置退避計數
             record = DeliveryRecord(
                 chat_id=chat_id,
                 priority=notifications[0].priority,

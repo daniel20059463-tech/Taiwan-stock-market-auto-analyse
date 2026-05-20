@@ -94,7 +94,8 @@ class User(Base):
         Numeric(18, 8), nullable=False, default=Decimal("0")
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), default=lambda: datetime.now(timezone.utc)
     )
 
     positions: Mapped[list[Position]] = relationship(
@@ -133,7 +134,8 @@ class Position(Base):
         Numeric(18, 8), nullable=False, default=Decimal("0")
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), default=lambda: datetime.now(timezone.utc)
     )
 
     user: Mapped[User] = relationship("User", back_populates="positions")
@@ -170,7 +172,8 @@ class Transaction(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="completed")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), default=lambda: datetime.now(timezone.utc)
     )
 
     user: Mapped[User] = relationship("User", back_populates="transactions")
@@ -214,7 +217,8 @@ class PaperTrade(Base):
     )
     trade_ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)    # Exchange ts (ms)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), default=lambda: datetime.now(timezone.utc)
     )
 
 
@@ -292,11 +296,13 @@ class PaperPositionSnapshot(Base):
     )
     entry_atr: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), default=lambda: datetime.now(timezone.utc)
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(),
-        onupdate=func.now(),
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
 
 
@@ -427,7 +433,8 @@ class StrategyParamLog(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     trade_count_basis: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), default=lambda: datetime.now(timezone.utc)
     )
 
 
