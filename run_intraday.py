@@ -300,13 +300,42 @@ def main() -> None:
     with open(POSITIONS_PATH, "w", encoding="utf-8") as f:
         json.dump(pos_data, f, ensure_ascii=False, indent=2)
 
+    # ── 建立持倉狀態摘要（每次都推）────────────────────────────────────────────
+    status_lines = []
+    for sym, pos in positions.items():
+        price = fetch_price(sym)
+        if price is None:
+            status_lines.append(f"  {sym}：無法取得報價")
+            continue
+        entry  = pos["entry_price"]
+        shares = pos["shares"]
+        trail  = pos.get("trail_stop_price", pos["stop_price"])
+        target = pos.get("target_price", "-")
+        name   = pos.get("name", sym)
+        pnl_pct = (price - entry) / entry * 100
+        net_est = calc_net_pnl(entry, price, shares)
+        dist_stop   = (price - trail) / price * 100
+        dist_target = (float(target) - price) / price * 100 if target != "-" else None
+        dist_str = f"距停損 {dist_stop:+.1f}%"
+        if dist_target is not None:
+            dist_str += f"  距目標 {dist_target:+.1f}%"
+        status_lines.append(
+            f"  {sym} {name}  {price:.2f}  {pnl_pct:+.1f}%（淨 {net_est:+,.0f}）\n"
+            f"    停損 {trail:.2f}  {dist_str}"
+        )
+
+    status_block = "\n".join(status_lines) if status_lines else "  （無持倉）"
+
     if alerts:
-        msg = f"盤中出場通知 | {NOW_STR}\n\n" + "\n\n".join(alerts)
-        msg += f"\n\n現金餘額：{cash:,.0f} 元"
-        print(msg)
-        send_telegram(msg)
+        header = f"⚡ 盤中操作 | {NOW_STR}"
+        ops_block = "\n\n".join(alerts)
+        msg = f"{header}\n\n{ops_block}\n\n── 目前持倉 ──\n{status_block}\n\n現金 {recalc_cash:,.0f} 元"
     else:
-        print(f"[{NOW_STR}] 持倉正常，無出場訊號。")
+        header = f"📊 盤中快報 | {NOW_STR}  無操作"
+        msg = f"{header}\n\n{status_block}\n\n現金 {recalc_cash:,.0f} 元"
+
+    print(msg)
+    send_telegram(msg)
 
 
 if __name__ == "__main__":
